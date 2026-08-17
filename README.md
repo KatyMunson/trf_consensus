@@ -1,0 +1,227 @@
+# TRF Motif Consensus-of-Consensus Pipeline
+
+Fully automatic, no manually-curated candidate list: scans a raw TRF `.dat`
+file for candidate period bins, builds a ranked set of consensus sequences
+per bin via iterative clustering, resolves redundancy across every cluster
+found (including tandem-duplicate relationships between different bins),
+and outputs a single RepeatMasker-ready custom library plus a QC summary
+table.
+
+## Pipeline
+
+```
+scan_dat_candidates (checkpoint)
+        |
+        v
+extract_by_period  (per bin)
+        |
+        v
+rank_family_clusters  (per bin: iterative clustering + per-cluster consensus)
+        |
+        v
+build_all_clusters_table  +  combine_cluster_fastas
+        |
+        v
+cross_cluster_comparison
+        |
+        v
+resolve_redundancy
+        |
+        v
+results/repeatmasker_custom_lib.fasta + results/summary_table.tsv
+```
+
+1. **`scan_dat_candidates`** scans the whole `.dat` file directly and
+   nominates every period bin meeting the `candidate_scan` filters (see
+   below). This is a Snakemake **checkpoint** — the bin list isn't known
+   until this actually runs, so everything downstream is generated
+   dynamically from its output, not from a static manifest file. There's no
+   manual pause or curation step: every passing bin proceeds automatically.
+2. **`extract_by_period`** pulls each bin's loci out of the `.dat` file
+   (unchanged from earlier versions of this pipeline).
+3. **`rank_family_clusters`** replaces the old two-round primary/secondary
+   system entirely. For each bin, it repeatedly: picks a reference sequence
+   (median length among whatever remains), anchor-matches everyone else
+   against it (rotation- and strand-aware, via `edlib`), peels off what
+   matches as one cluster, and repeats on the leftovers — until the
+   remaining pool is smaller than `min_cluster_size` or `max_rounds` is
+   hit. All discovered clusters in a bin are then sorted by size: rank 1 =
+   most support, rank 2 = next, etc. Each cluster gets its own MAFFT
+   alignment and majority-rule consensus. **Sequences that never join a
+   cluster of the minimum size are dropped, not reported** — this pipeline
+   is tuned for finding high-signal candidates (centromeric/large satellite
+   arrays), not for characterizing background noise.
+
+   This is deliberately **not** full all-vs-all pairwise clustering.
+   All-vs-all is O(N²) alignments — a bin with a few thousand loci is
+   millions of pairs, hours of compute on one core. Iterative peeling is
+   O(rounds × N): each round is one reference vs. the remaining pool (an
+   O(N) pass), and the round count is just however many distinct coherent
+   families actually exist in the bin (usually small). It also makes the
+   old primary/secondary "swap" logic unnecessary — nothing is labeled
+   primary until every cluster in every bin has been found and sizes
+   compared globally, in the redundancy-resolution step below.
+4. **`build_all_clusters_table`** + **`combine_cluster_fastas`** aggregate
+   every bin's ranked clusters into one master table and one combined FASTA.
+5. **`cross_cluster_comparison`** compares every cluster found — all bins,
+   all ranks, including different ranks within the same bin — using
+   **coverage-aware tiling with a randomization significance test**, not a
+   single lump alignment. For each pair (shorter sequence A, longer
+   sequence B), it greedily tiles B with non-overlapping copies of A
+   (rotation- and strand-aware, masking each match before searching for the
+   next) and requires both a per-copy identity threshold AND that the tiled
+   copies explain most of B's length (`min_coverage`, default 0.85) before
+   even considering a relationship. This replaced an earlier version that
+   concatenated exactly *k* copies of A and aligned the whole thing as one
+   block — averaging identity over that whole alignment let a small,
+   near-perfect *embedded cassette* match drag up the aggregate score even
+   when most of B was genuinely unrelated content, silently discarding real
+   distinct motifs that happen to share a common building-block subsequence
+   with something more abundant. Every pair that clears the coverage/identity
+   bar then gets a **second, statistical check**: the same tiling procedure
+   is re-run against `n_shuffles` (default 20) mononucleotide-shuffled
+   versions of A, and the real match must beat all (or `max_null_passes`)
+   of those shuffled attempts — this catches cases where repeatedly giving a
+   pair several independent tiling attempts (up to `max_copies`) would
+   otherwise inflate the false-positive rate beyond what the raw identity
+   threshold implies, especially for short or compositionally simple
+   sequences.
+6. **`resolve_redundancy`** processes clusters in descending support order
+   (highest `n_input_sequences` first). Each cluster is checked only
+   against clusters **already confirmed as winners** — never against
+   another loser, never chained through an intermediate. If it's flagged
+   against an existing winner, it's marked redundant with that winner
+   specifically (a direct, individually-verified relationship); otherwise
+   it becomes a new winner itself. **This deliberately avoids transitive
+   union-find** (A~B flagged + B~C flagged does NOT imply A~C) — plain
+   union-find over flagged pairs was tried first and, on real data,
+   collapsed dozens of genuinely unrelated candidates spanning an 11x
+   period range into one meaningless "family" simply because each
+   consecutive pair along a chain happened to be individually flagged.
+   Nothing is dropped — losers are kept in both the summary table and the
+   final RepeatMasker library, marked `is_redundant=True` / demoted to
+   `#Satellite/redundant_with_<winner>` in the library's classification
+   field, so they're still visible (and RepeatMasker-usable) but clearly
+   lower priority.
+
+## Sanity-checking a mega-group
+
+If one cluster ends up "winning" a large redundancy group (many clusters
+spanning a wide range of target periods all marked redundant with it),
+don't assume that's necessarily wrong — it can be a genuine finding: a
+small, highly abundant repeat unit that's been incorporated as a building
+block into many otherwise-distinct larger motifs across the genome (a real
+pattern for old, dominant satellite families). Before trusting it, check:
+`coverage` and `n_copies_found` in `cross_cluster_comparison.tsv` tell you
+whether a given partner is *fully* explained by the winner (safe to treat
+as redundant) or only *partially* (`coverage` well below 1.0 — that
+partner likely has real, distinct content of its own and deserves to be
+its own candidate, not demoted). `null_passes` tells you how many of the
+20 randomization trials also passed by chance — anything above 0 is worth
+a second look.
+
+## Setup
+
+Edit `config/config.yaml`:
+- `trf_dat`: path to your `.dat` file
+- `trf_dat_default_seqname`: only needed if your `.dat` has no header lines at all
+- `repeatmasker_classification`: default `"Satellite"` — edit to match how you
+  want these classified before loading into RepeatMasker/FamDB
+- **Verify the MAFFT module name** — `rank_family_clusters` requests
+  `mafft/7.487` via `envmodules:`. Run `module avail mafft` on liger and
+  update the Snakefile if the version differs.
+
+## Run
+
+```bash
+snakemake -s Snakefile --configfile config/config.yaml \
+    --cores 48 --use-envmodules --retries 3
+```
+
+(Swap `--use-envmodules` for `--use-conda` to run off the per-rule envs in
+`workflow/envs/` instead: `python_base.yaml` for pure-Python rules,
+`edlib.yaml` for `cross_cluster_comparison`, `cluster_rank.yaml`
+[edlib + mafft together] for `rank_family_clusters`, the only rule that
+needs both tools in one process.)
+
+Because `scan_dat_candidates` is a checkpoint, the first `snakemake -n`
+dry-run will report "the run involves checkpoint jobs, which will result in
+alteration of the DAG of jobs" — that's expected, not an error. The actual
+per-bin job count isn't known until the scan completes.
+
+## Config knobs
+
+**`candidate_scan`** — which period bins get processed at all. A bin passes
+if EITHER: (distributed) `≥min_blocks` total loci within `period±window`
+AND at least one with `copy_number ≥ min_copy_number`; OR (single massive
+block) any one locus with `copy_number ≥ min_single_block_copy_number`,
+regardless of block count — this catches a genuine large array TRF captured
+as one contiguous locus, which the distributed rule alone would reject.
+`min_period_length` filters out micro/mini-satellites before either rule is
+applied. `nms_radius` prevents nearby period values (TRF's period estimate
+jitters a few bp locus-to-locus for the same true repeat) from being
+reported as separate candidates.
+
+**`cluster_ranking`** — `min_cluster_size` (default 3) is the floor for a
+peeled-off group to count as a real cluster; `max_rounds` (default 15) is a
+safety cap; `min_cluster_identity` (default 0.80) is the edlib identity
+required to join a cluster; `max_gap_fraction` (default 0.5) is the
+alignment-column gap fraction above which a column is dropped from the
+consensus.
+
+**`cross_cluster_comparison`** — `min_identity` (default 0.70) is the
+per-copy identity required when tiling; `min_coverage` (0.85) is the
+fraction of the longer sequence that must be explained by tiled copies;
+`max_copies` (6) bounds how many tiled copies are searched for per pair;
+`n_shuffles` (20) and `max_null_passes` (0) control the randomization
+significance test — raise `max_null_passes` above 0 only if you want a more
+permissive (less strict) confirmation criterion.
+
+## Outputs
+
+- `results/candidate_periods.tsv` / `candidate_periods_raw.tsv` /
+  `candidate_periods_manifest.tsv` — the scan's output (see
+  `scan_dat_candidates.py` docstring for column definitions)
+- `results/{motif}/01_raw_consensus.fasta` + `.tsv` — extracted per-locus
+  consensus motifs + provenance for that bin
+- `results/{motif}/ranked_clusters/rank01_n<N>.fasta`, `rank02_...`, etc. —
+  one consensus per cluster found in that bin
+- `results/{motif}/ranked_clusters_summary.tsv` — per-bin cluster ranking
+- `results/all_clusters.tsv` — every cluster from every bin, one master table
+- `results/all_clusters_consensus.fasta` — every cluster's consensus, combined
+- `results/cross_cluster_comparison.tsv` — pairwise similarity/multiple-of
+  check across every cluster found
+- `results/repeatmasker_custom_lib.fasta` — **final output**: every
+  cluster's consensus, headers as `>{label}#{classification}` (winners) or
+  `>{label}#{classification}/redundant_with_{winner}` (demoted)
+- `results/summary_table.tsv` — **final output**: `all_clusters.tsv` plus
+  `is_redundant` / `redundant_with` / `group_size`
+
+## `results/summary_table.tsv` columns
+
+| column | meaning |
+|---|---|
+| `label` | unique ID, `{motif}_rank{rank}_n{N}` — matches the FASTA header in `repeatmasker_custom_lib.fasta` |
+| `motif` / `target_period` / `window` | which scan bin this cluster came from |
+| `rank` | this cluster's size rank *within its bin* (1 = most loci in that bin) |
+| `n_input_sequences` | loci that joined this specific cluster — the core "how much support" number |
+| `pct_of_bin` | `n_input_sequences` as a % of the bin's total loci |
+| `consensus_length` / `gc_content` | of this cluster's consensus sequence |
+| `is_redundant` | True if this cluster lost a redundancy comparison to another (higher-support) cluster |
+| `redundant_with` | the winning cluster's `label`, if `is_redundant` |
+| `group_size` | how many clusters (across the whole run) got grouped together as redundant with each other |
+
+## Sanity checks worth doing on real data
+
+- Sort `summary_table.tsv` by `n_input_sequences` descending — your
+  strongest centromeric/large-satellite candidates are at the top,
+  regardless of which bin they came from.
+- Check `group_size` for anything > 1 — that cluster was found to be
+  redundant with something else; `redundant_with` tells you which cluster
+  won and why (compare `n_input_sequences` between the two).
+- A bin producing zero clusters (missing from `all_clusters.tsv` entirely)
+  means every locus in that bin failed to join a cluster of `min_cluster_size`
+  — the bin wasn't coherent enough to be trustworthy, not a bug.
+- Eyeball a cluster's `ranked_clusters/rank0N_*.fasta` against
+  `01_raw_consensus.fasta` in an alignment viewer before fully trusting a
+  borderline consensus, especially one near the `min_cluster_size` floor.

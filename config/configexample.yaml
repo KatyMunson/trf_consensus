@@ -1,0 +1,88 @@
+# =============================================================================
+# config.yaml — TRF motif consensus-of-consensus pipeline
+#
+# Fully programmatic: scans the whole .dat file for candidate period bins,
+# no manually-curated periods.tsv. See Snakefile header for the full flow.
+# =============================================================================
+
+# Path to the TRF .dat file (native TRF output, not the .bed conversion)
+trf_dat: "/path/to/trf.dat"
+
+# Source contig/scaffold name to label entries with when the .dat file has
+# no header lines at all (neither "Sequence: <name>" nor "@<name>" -ngs
+# style). Leave "" if your .dat has real headers.
+trf_dat_default_seqname: ""
+
+# RepeatMasker library classification suffix, e.g. "Satellite" or
+# "Satellite/centromeric" — EDIT this to match how you want these classified
+# before loading into RepeatMasker / FamDB. Redundant/demoted clusters get
+# "/redundant_with_<label>" appended automatically.
+repeatmasker_classification: "Satellite"
+
+# --- Step 1: candidate period bin scanning ---
+# Nominates period sizes worth pulling loci for. A bin passes if EITHER:
+#   distributed: >=min_blocks total loci within period+/-window, AND >=1 with
+#     copy_number >= min_copy_number
+#   single massive block: ANY one locus with copy_number >= min_single_block_copy_number,
+#     regardless of block count (catches a large array TRF captured as one locus)
+candidate_scan:
+  min_copy_number: 100
+  min_blocks: 5
+  min_single_block_copy_number: 300
+  min_period_length: 150
+  window: 5              # +/- tolerance for both block-counting and extraction
+  nms_radius: 5           # suppression radius so nearby period values don't get
+                          # reported as separate candidates (see scan_dat_candidates.py)
+
+# --- Step 2: iterative cluster ranking (per bin) ---
+# Repeatedly peels off the largest coherent sequence cluster from a bin,
+# ranks all discovered clusters by size. O(rounds x N), not O(N^2) all-vs-all.
+cluster_ranking:
+  min_cluster_size: 3    # stop peeling once the remainder (or a new cluster) is smaller than this
+  max_rounds: 15          # safety cap on peeling rounds per bin
+  min_cluster_identity: 0.80  # edlib anchor-match identity required to join a cluster
+  max_gap_fraction: 0.5        # alignment columns with >= this gap fraction are dropped from the consensus
+
+# --- Step 3: cross-cluster redundancy resolution ---
+# Same rotation/strand-aware edlib comparison as before, now run across every
+# cluster found in every bin (including different ranks within the same bin).
+# Flagged pairs are grouped (transitively) and the cluster with the most
+# support (highest n_input_sequences) in each group wins; others are kept in
+# the output but marked redundant.
+cross_cluster_comparison:
+  min_identity: 0.70        # per-copy identity required when tiling the shorter sequence against the longer
+  min_coverage: 0.85         # fraction of the longer sequence's length that must be explained by tiled copies
+  max_copies: 6               # largest number of tiled copies to search for per pair
+  n_shuffles: 20               # mononucleotide-shuffled null trials per candidate-passing pair
+  max_null_passes: 0           # a pair is only confirmed if at most this many shuffled trials also pass
+                                # min_coverage (default 0 = ALL shuffles must fail to confirm real signal)
+
+resources:
+  scan_dat_candidates:
+    threads: 1
+    mem: 4
+    hrs: 1
+  combine_cluster_fastas:
+    threads: 1
+    mem: 2
+    hrs: 1
+  extract_by_period:
+    threads: 1
+    mem: 4
+    hrs: 2
+  rank_family_clusters:
+    threads: 1
+    mem: 6
+    hrs: 4
+  build_all_clusters_table:
+    threads: 1
+    mem: 2
+    hrs: 1
+  cross_cluster_comparison:
+    threads: 1
+    mem: 2
+    hrs: 4
+  resolve_redundancy:
+    threads: 1
+    mem: 2
+    hrs: 1

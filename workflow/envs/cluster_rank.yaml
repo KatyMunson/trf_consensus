@@ -1,0 +1,10 @@
+name: trf_consensus_cluster_rank
+channels:
+  - bioconda
+  - conda-forge
+dependencies:
+  - python=3.11
+  - mafft>=7.487
+  - pip
+  - pip:
+      - edlib
