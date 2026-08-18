@@ -287,24 +287,40 @@ accepted approximation of the doubling trick, not something the parser
 tries to correct for, so treat a borderline or surprising top hit as worth
 a manual look rather than taking the score at face value.
 
+**Why `repeatmasker=4.1.5`, not the latest release**: `workflow/envs/repeatmasker.yaml`
+exact-pins RepeatMasker to 4.1.5, matching `vollgerlab/Rhodonite`'s pin
+(already proven working on this cluster), rather than floor-pinning to the
+latest release the way `mafft>=7.487` is pinned elsewhere in this repo.
+This is deliberate, not an oversight: bioconda's `repeatmasker>=4.2.4`
+recipe gets its Dfam/FamDB library from a separate `famdb` conda package
+that — confirmed by reading `recipes/famdb/build.sh` in bioconda-recipes —
+ships only `famdb.py` and its helper scripts, no `*.h5` data at all. On
+that version chain, `-species` mode never works out of the box, on any
+node, regardless of internet access; it always needs a manual per-env
+download-and-`configure` step (see below). `repeatmasker=4.1.5` instead has
+a working `post-link.sh` that downloads a real Dfam library over the
+network automatically, at conda-install time — the same mechanism that
+already works for Rhodonite's own env on this cluster. If a future
+RepeatMasker/bioconda release restores automatic FamDB provisioning for
+newer versions, this pin is worth revisiting.
+
 **Troubleshooting `ERROR:__main__:FamDB data directory not found`** (from
-`run_repeatmasker_known_screen.log`): this means the conda-installed
-RepeatMasker has no Dfam FamDB library configured at all, not just a
-smaller-than-hoped-for one. bioconda's `repeatmasker` recipe normally
-auto-downloads a curated FamDB partition via a post-link script; on an SGE
-cluster this commonly fails silently because the node that builds/activates
-the conda env has no outbound internet. Fix: from a machine that does have
-internet, download a FamDB partition from
-`https://www.dfam.org/releases/current/families/FamDB/` (the curated-only
-partition is the fastest way to get unblocked; the fuller partition set has
-more RepeatModeler-derived content, see below), transfer it to the cluster,
-then inside the conda env (`.snakemake/conda/<hash>/`, or wherever
-`--conda-prefix` points) run that install's own `configure` script with
-`-famdb_dir /path/to/downloaded/files`. This bakes the library path into
-that specific installation's config, so it persists across pipeline
-re-runs as long as the conda env itself isn't rebuilt (env yaml change,
-`--conda-cleanup-envs`, a fresh clone, or a different `--conda-prefix` all
-invalidate it).
+`run_repeatmasker_known_screen.log`): with the 4.1.5 pin this should be
+rare — it means even the old-style `post-link.sh` download failed, most
+likely because the node that built/activated the conda env had no outbound
+internet at that moment (common for SGE compute nodes; login nodes more
+often have it). First try just rebuilding the env from a node with internet
+access. If that's not an option, fall back to manual setup: download a
+FamDB partition from `https://www.dfam.org/releases/current/families/FamDB/`
+(the curated-only partition is fastest to get unblocked with; the fuller
+partition set has more RepeatModeler-derived content, see below), transfer
+it to the cluster, then inside the conda env (`.snakemake/conda/<hash>/`,
+or wherever `--conda-prefix` points) run that install's own `configure`
+script with `-famdb_dir /path/to/downloaded/files`. This bakes the library
+path into that specific installation's config, so it persists across
+pipeline re-runs as long as the conda env itself isn't rebuilt (env yaml
+change, `--conda-cleanup-envs`, a fresh clone, or a different
+`--conda-prefix` all invalidate it).
 
 **Worth checking before trusting a clean screen as conclusive**: even once
 FamDB is configured, the library that ships with a fresh install may itself

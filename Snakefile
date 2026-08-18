@@ -34,8 +34,13 @@
 #      characterized repeat family in Dfam/RepBase. A targeted, much
 #      cheaper "is this already known" check than screening the whole
 #      assembly. Uses a fresh, pipeline-owned RepeatMasker install (conda
-#      only, see workflow/envs/repeatmasker.yaml), independent of whatever
-#      version/library may already be on the cluster.
+#      only, see workflow/envs/repeatmasker.yaml — exact-pinned to 4.1.5,
+#      NOT the latest release, because bioconda's repeatmasker>=4.2.4 gets
+#      its Dfam/FamDB library from a separate package that ships no actual
+#      data, so -species mode never works out of the box on that version
+#      chain; 4.1.5 downloads a real library automatically via its own
+#      post-link.sh at install time), independent of whatever version/
+#      library may already be on the cluster.
 #
 # This requires Snakemake checkpoints (checkpoint scan_dat_candidates):
 # the bin list isn't known until the scan actually runs, so downstream rules
@@ -327,9 +332,10 @@ rule prepare_known_repeat_query:
 rule run_repeatmasker_known_screen:
     # Deliberately conda-only, no envmodules: fallback — unlike every other
     # rule in this pipeline. The point of this rule is a fresh,
-    # pipeline-owned RepeatMasker install (latest release, its own bundled
-    # library), not reuse of whatever version/library happens to already be
-    # on the cluster.
+    # pipeline-owned RepeatMasker install, its own bundled library, not
+    # reuse of whatever version/library happens to already be on the
+    # cluster. Exact-pinned to 4.1.5 in workflow/envs/repeatmasker.yaml
+    # rather than the latest release — see that file for why.
     input:
         "results/known_repeat_screen/query.fasta"
     output:
