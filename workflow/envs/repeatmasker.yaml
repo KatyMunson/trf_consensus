@@ -1,0 +1,7 @@
+name: trf_consensus_repeatmasker
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - repeatmasker>=4.2.4

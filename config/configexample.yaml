@@ -65,6 +65,30 @@ cross_cluster_comparison:
   max_null_passes: 0           # a pair is only confirmed if at most this many shuffled trials also pass
                                 # min_coverage (default 0 = ALL shuffles must fail to confirm real signal)
 
+# --- Step 4: known-repeat screening (results/known_repeat_hits.tsv) ---
+# Runs RepeatMasker with -species against our OWN discovered consensus
+# motifs (not the assembly) to check whether any match a previously
+# characterized repeat family in Dfam/RepBase. Much cheaper and more
+# targeted than screening the whole assembly: ~100-250 short sequences,
+# well under a minute of actual RepeatMasker runtime regardless of library
+# size.
+known_repeat_screen:
+  species: "zebra finch"  # RepeatMasker -species value. Per FamDB's own docs, specifying a
+                      # species pulls its ENTIRE ancestor lineage automatically (Aves,
+                      # Neognathae, etc. all inherited) PLUS any species-specific
+                      # curated/de novo content filed at that node specifically —
+                      # specificity is additive here, not narrowing, so there's no downside
+                      # to using the most specific available relative rather than a broad
+                      # clade name. Before committing, check what's actually populated with:
+                      #   famdb.py -i <path-to-famdb> lineage -c "zebra finch"
+                      # (family counts at each taxonomic level in the lineage — if zero are
+                      # lineage-specific to zebra finch, querying "aves" would be equivalent).
+  double_sequences: true  # concatenate each consensus to itself before screening, so a
+                           # database entry starting at a different rotation phase can still
+                           # align end-to-end against a contiguous stretch of the query. Same
+                           # trick used internally elsewhere in this pipeline (see
+                           # cross_motif_comparison.py).
+
 resources:
   scan_dat_candidates:
     threads: 1
@@ -91,6 +115,18 @@ resources:
     mem: 2
     hrs: 4
   resolve_redundancy:
+    threads: 1
+    mem: 2
+    hrs: 1
+  prepare_known_repeat_query:
+    threads: 1
+    mem: 2
+    hrs: 1
+  run_repeatmasker_known_screen:
+    threads: 4
+    mem: 8
+    hrs: 2
+  parse_known_repeat_hits:
     threads: 1
     mem: 2
     hrs: 1

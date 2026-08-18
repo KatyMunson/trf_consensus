@@ -130,13 +130,25 @@ Edit `config/config.yaml`:
 - **Verify the MAFFT module name** — `rank_family_clusters` requests
   `mafft/7.487` via `envmodules:`. Run `module avail mafft` on liger and
   update the Snakefile if the version differs.
+- `known_repeat_screen.species`: the RepeatMasker `-species` value to
+  screen discovered motifs against (see "Known-repeat screening" below).
 
 ## Run
 
 ```bash
 snakemake -s Snakefile --configfile config/config.yaml \
-    --cores 48 --use-envmodules --retries 3
+    --cores 48 --use-envmodules --use-conda --retries 3
 ```
+
+**Both `--use-envmodules` and `--use-conda` are required together** — every
+rule but one uses envmodules (matching the rest of this pipeline's
+cluster-module setup), but `run_repeatmasker_known_screen` deliberately has
+no `envmodules:` fallback (it installs its own fresh, pipeline-owned
+RepeatMasker via conda rather than reusing whatever's already on the
+cluster — see "Known-repeat screening" below). Passing both flags lets
+Snakemake use envmodules wherever a rule defines them and fall back to
+conda for that one rule; passing `--use-envmodules` alone would run
+RepeatMasker with no environment management at all.
 
 (Swap `--use-envmodules` for `--use-conda` to run off the per-rule envs in
 `workflow/envs/` instead: `python_base.yaml` for pure-Python rules,
@@ -194,6 +206,10 @@ fraction of the longer sequence that must be explained by tiled copies;
 significance test — raise `max_null_passes` above 0 only if you want a more
 permissive (less strict) confirmation criterion.
 
+**`known_repeat_screen`** — `species` is the RepeatMasker `-species` value;
+`double_sequences` (default true) controls the rotation-tolerant doubling
+trick. See "Known-repeat screening" below for the full rationale.
+
 ## Outputs
 
 - `results/candidate_periods.tsv` / `candidate_periods_raw.tsv` /
@@ -213,6 +229,71 @@ permissive (less strict) confirmation criterion.
   `>{label}#{classification}/redundant_with_{winner}` (demoted)
 - `results/summary_table.tsv` — **final output**: `all_clusters.tsv` plus
   `is_redundant` / `redundant_with` / `group_size`
+- `results/known_repeat_hits.tsv` — **final output**: every cluster's
+  `label` joined against a Dfam/RepBase known-repeat screen, see
+  "Known-repeat screening" below
+
+## Known-repeat screening
+
+A separate, final step screens our own discovered consensus motifs (not
+the genome assembly) against a Dfam/RepBase library, via
+`RepeatMasker -species`, to check whether any of them match a previously
+characterized/named repeat family. This answers a narrower, more direct
+question than running RepeatMasker against the whole assembly — "is this
+specific candidate we found already known?" — and is much cheaper: ~100-250
+short sequences, well under a minute of actual RepeatMasker runtime
+regardless of library size, versus screening an entire genome.
+
+This step runs on `results/repeatmasker_custom_lib.fasta` (the final
+output — every cluster, winners and redundancy-demoted ones both, since a
+demoted cluster individually matching a known family is still useful
+information) and is wired into `rule all` alongside the other final
+outputs, consistent with this pipeline's fully-automatic design — there's
+no separate flag to opt in or out.
+
+**Pipeline**: `prepare_known_repeat_query` (strips our own
+`#classification` suffix off each header, since it's not a valid
+RepeatMasker query name and `#` has special meaning in RepeatMasker's own
+library format) → `run_repeatmasker_known_screen` (RepeatMasker itself) →
+`parse_known_repeat_hits` (turns the `.out` file into
+`results/known_repeat_hits.tsv`).
+
+**Config** (`known_repeat_screen` in `config/config.yaml`):
+- `species` — the RepeatMasker `-species` value. Per FamDB's own docs,
+  specifying a species pulls its entire ancestor lineage automatically
+  (e.g. Aves, Neognathae, ... all inherited) plus any species-specific
+  curated/de novo content filed at that node — specificity is additive
+  here, not narrowing, so use the most specific available relative. Before
+  relying on a species value, check what's actually populated with
+  `famdb.py -i <path-to-famdb> lineage -c "<species>"`.
+- `double_sequences` — concatenates each consensus to itself before
+  screening (`seq+seq`), so a database entry that starts at a different
+  rotation phase than our consensus can still align end-to-end against a
+  contiguous stretch of the query, instead of being missed because the
+  real match wraps around the end of a single un-doubled copy. Same trick
+  used internally elsewhere in this pipeline (`cross_motif_comparison.py`).
+
+**Reading `known_repeat_hits.tsv`**: one row per cluster `label` (same join
+key as `summary_table.tsv`), always present whether or not RepeatMasker
+found anything — `has_known_hit=False` with the rest of the columns `NA` is
+a normal, common, and often the *expected* outcome, not a failure: much of
+the satellite DNA in a non-model species genome is genuinely undescribed in
+existing databases. When `has_known_hit=True`, `repeat_name` /
+`repeat_class_family` identify the match, and `sw_score` /
+`pct_divergence` describe its quality. If a query was doubled, a real match
+that happens to span the artificial doubling junction can produce an
+inflated or split-looking score right at that boundary — this is an
+accepted approximation of the doubling trick, not something the parser
+tries to correct for, so treat a borderline or surprising top hit as worth
+a manual look rather than taking the score at face value.
+
+**Worth checking before trusting a clean screen as conclusive**: the
+RepeatMasker library that ships with a fresh install may itself be a
+smaller curated-only subset of Dfam, not the fullest available content
+(e.g. de novo species-specific libraries contributed separately) —
+`famdb.py ... lineage -c "<species>"` family counts are worth a look
+alongside the results here, independent of the specific-vs-broad species
+question above.
 
 ## `results/summary_table.tsv` columns
 
