@@ -55,6 +55,8 @@
 # Created: 2026-08
 # =============================================================================
 
+import os
+
 wildcard_constraints:
     motif="[^/]+",
 
@@ -343,7 +345,8 @@ rule run_repeatmasker_known_screen:
         "results/known_repeat_screen/query.fasta.out"
     params:
         species=config["known_repeat_screen"]["species"],
-        outdir="results/known_repeat_screen"
+        outdir="results/known_repeat_screen",
+        input_abs=lambda wc, input: os.path.abspath(input[0])
     log:
         "results/logs/run_repeatmasker_known_screen.log"
     threads: config["resources"]["run_repeatmasker_known_screen"]["threads"]
@@ -370,8 +373,22 @@ rule run_repeatmasker_known_screen:
         # derived families are where species-specific content most likely
         # lives) — so there's no reason to withhold it here the way you
         # might for whole-genome masking.
+        # `cd {params.outdir}` + trap: RepeatMasker's own source
+        # (createTempDir()) creates its RM_<pid>.<timestamp> scratch
+        # directory relative to the process's actual cwd, always — `-dir`
+        # is only ever consulted as a fallback if writing to cwd fails
+        # outright, so without this it litters the repo root (Snakemake
+        # jobs run with cwd = the Snakefile's directory) on every
+        # invocation. RepeatMasker does self-delete it, but only via the
+        # very last line of its main script (`rm -R $tempdir unless
+        # $DEBUG`) — any crash/die anywhere earlier skips that entirely.
+        # cd'ing into -dir first at least contains any leftover debris
+        # inside results/known_repeat_screen/ instead of the repo root; the
+        # trap goes further and guarantees cleanup here even when
+        # RepeatMasker itself fails, which its own logic does not.
+        "(cd {params.outdir} && trap 'rm -rf RM_*' EXIT && "
         "RepeatMasker -species '{params.species}' -pa {threads} -uncurated "
-        "-dir {params.outdir} {input} > {log} 2>&1 && touch {output}"
+        "-dir . {params.input_abs}) > {log} 2>&1 && touch {output}"
 
 
 rule parse_known_repeat_hits:

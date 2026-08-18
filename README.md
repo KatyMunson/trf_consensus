@@ -258,6 +258,22 @@ library format) → `run_repeatmasker_known_screen` (RepeatMasker itself) →
 `parse_known_repeat_hits` (turns the `.out` file into
 `results/known_repeat_hits.tsv`).
 
+`run_repeatmasker_known_screen` runs RepeatMasker from inside
+`results/known_repeat_screen/`, not the repo root — RepeatMasker's own
+`RM_<pid>.<timestamp>` scratch directory is always created relative to the
+process's actual working directory (confirmed by reading its source,
+`createTempDir()`; `-dir` is only ever consulted as a fallback if writing
+to cwd fails outright), so without this it would litter the repo root on
+every invocation. RepeatMasker does normally self-delete its own scratch
+dir, but only via the very last line of its main script — any crash or
+interruption anywhere earlier skips that entirely, which is why you may
+still see a stray `RM_*` directory after a failed run despite this. The
+rule also traps on exit to remove it regardless of success or failure, so
+this should be rare going forward; any that are still lying around from
+before this fix are safe to delete by hand
+(`rm -rf results/known_repeat_screen/RM_*` — or, from old runs before this
+was contained to that directory, `rm -rf RM_*` in the repo root).
+
 **Config** (`known_repeat_screen` in `config/config.yaml`):
 - `species` — the RepeatMasker `-species` value. Per FamDB's own docs,
   specifying a species pulls its entire ancestor lineage automatically
