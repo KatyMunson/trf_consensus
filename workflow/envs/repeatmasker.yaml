@@ -4,18 +4,17 @@ channels:
   - bioconda
   - defaults
 dependencies:
-  # Exact-pinned, deliberately NOT the latest release (4.2.4 as of writing)
-  # and NOT a floor pin like mafft>=7.487 elsewhere in this repo. bioconda's
-  # repeatmasker>=4.2.4 recipe gets its Dfam/FamDB library from a separate
-  # `famdb` conda package that ships famdb.py but NO actual *.h5 data at
-  # all (confirmed by reading bioconda-recipes' recipes/famdb/build.sh) —
-  # so -species mode never works out of the box on that version chain,
-  # regardless of network access, and needs a manual per-env
-  # download-and-configure step every time. repeatmasker=4.1.5 (matching
-  # vollgerlab/Rhodonite's pin, already proven working on this cluster) has
-  # a working post-link.sh that downloads the real Dfam library over the
-  # network at conda-install time, same as it does for Rhodonite's own env
-  # — so this pin trades "always latest" for "actually works without a
-  # manual FamDB setup step." Revisit if a future repeatmasker release
-  # restores automatic FamDB provisioning.
-  - repeatmasker=4.1.5
+  # Floor-pinned to the latest release, same convention as mafft>=7.487
+  # elsewhere in this repo. bioconda's repeatmasker>=4.2.4 gets its Dfam/
+  # FamDB library from a separate `famdb` conda package that ships the
+  # famdb.py TOOL but no *.h5 DATA — so the first run after a fresh env
+  # build will fail with "FamDB data directory not found." This is
+  # expected, not a bug: see the README's "Known-repeat screening" section
+  # for the one-time manual download-and-configure step. This is the only
+  # path to current, full (curated+uncurated) Dfam data — the alternative
+  # (pinning to an older release like 4.1.5 for its automatic but ancient,
+  # curated-only, pre-2023-schema library) was tried and rejected: that
+  # library's bundled famdb.py can't even read current-format dfam.org
+  # files, and was confirmed empty across the entire Aves lineage for a
+  # real test species.
+  - repeatmasker>=4.2.4

@@ -34,13 +34,13 @@
 #      characterized repeat family in Dfam/RepBase. A targeted, much
 #      cheaper "is this already known" check than screening the whole
 #      assembly. Uses a fresh, pipeline-owned RepeatMasker install (conda
-#      only, see workflow/envs/repeatmasker.yaml — exact-pinned to 4.1.5,
-#      NOT the latest release, because bioconda's repeatmasker>=4.2.4 gets
-#      its Dfam/FamDB library from a separate package that ships no actual
-#      data, so -species mode never works out of the box on that version
-#      chain; 4.1.5 downloads a real library automatically via its own
-#      post-link.sh at install time), independent of whatever version/
-#      library may already be on the cluster.
+#      only, see workflow/envs/repeatmasker.yaml — floor-pinned to the
+#      latest release. The FamDB library it needs does NOT come bundled or
+#      auto-downloaded on this version chain, so the first run after a
+#      fresh env build will fail with "FamDB data directory not found" —
+#      this is expected, not a bug; see the README's "Known-repeat
+#      screening" section for the one-time manual setup), independent of
+#      whatever version/library may already be on the cluster.
 #
 # This requires Snakemake checkpoints (checkpoint scan_dat_candidates):
 # the bin list isn't known until the scan actually runs, so downstream rules
@@ -334,8 +334,9 @@ rule run_repeatmasker_known_screen:
     # rule in this pipeline. The point of this rule is a fresh,
     # pipeline-owned RepeatMasker install, its own bundled library, not
     # reuse of whatever version/library happens to already be on the
-    # cluster. Exact-pinned to 4.1.5 in workflow/envs/repeatmasker.yaml
-    # rather than the latest release — see that file for why.
+    # cluster. Requires a one-time manual FamDB download-and-configure step
+    # per env build — see workflow/envs/repeatmasker.yaml and the README's
+    # "Known-repeat screening" section.
     input:
         "results/known_repeat_screen/query.fasta"
     output:

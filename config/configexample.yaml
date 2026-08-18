@@ -80,9 +80,12 @@ known_repeat_screen:
                       # specificity is additive here, not narrowing, so there's no downside
                       # to using the most specific available relative rather than a broad
                       # clade name. Before committing, check what's actually populated with:
-                      #   famdb.py -i <path-to-famdb> lineage -c "zebra finch"
-                      # (family counts at each taxonomic level in the lineage — if zero are
-                      # lineage-specific to zebra finch, querying "aves" would be equivalent).
+                      #   famdb.py -i <path-to-famdb> lineage -a "zebra finch"
+                      # (verify the exact flag against your installed famdb.py --help first —
+                      # this has changed across FamDB versions; see README's "Known-repeat
+                      # screening" section). Shows family counts at each taxonomic level in the
+                      # lineage — if zero are lineage-specific to zebra finch, querying "aves"
+                      # would be equivalent).
   double_sequences: true  # concatenate each consensus to itself before screening, so a
                            # database entry starting at a different rotation phase can still
                            # align end-to-end against a contiguous stretch of the query. Same

@@ -265,7 +265,9 @@ library format) → `run_repeatmasker_known_screen` (RepeatMasker itself) →
   curated/de novo content filed at that node — specificity is additive
   here, not narrowing, so use the most specific available relative. Before
   relying on a species value, check what's actually populated with
-  `famdb.py -i <path-to-famdb> lineage -c "<species>"`.
+  `famdb.py -i <path-to-famdb> lineage -a "<species>"` (verify the exact
+  flag against your installed `famdb.py --help`; this has changed across
+  versions — see "One-time setup" below).
 - `double_sequences` — concatenates each consensus to itself before
   screening (`seq+seq`), so a database entry that starts at a different
   rotation phase than our consensus can still align end-to-end against a
@@ -287,82 +289,73 @@ accepted approximation of the doubling trick, not something the parser
 tries to correct for, so treat a borderline or surprising top hit as worth
 a manual look rather than taking the score at face value.
 
-**Why `repeatmasker=4.1.5`, not the latest release**: `workflow/envs/repeatmasker.yaml`
-exact-pins RepeatMasker to 4.1.5, matching `vollgerlab/Rhodonite`'s pin
-(already proven working on this cluster), rather than floor-pinning to the
-latest release the way `mafft>=7.487` is pinned elsewhere in this repo.
-This is deliberate, not an oversight: bioconda's `repeatmasker>=4.2.4`
-recipe gets its Dfam/FamDB library from a separate `famdb` conda package
-that — confirmed by reading `recipes/famdb/build.sh` in bioconda-recipes —
-ships only `famdb.py` and its helper scripts, no `*.h5` data at all. On
-that version chain, `-species` mode never works out of the box, on any
-node, regardless of internet access; it always needs a manual per-env
-download-and-`configure` step (see below). `repeatmasker=4.1.5` instead has
-a working `post-link.sh` that downloads a real Dfam library over the
-network automatically, at conda-install time — the same mechanism that
-already works for Rhodonite's own env on this cluster. If a future
-RepeatMasker/bioconda release restores automatic FamDB provisioning for
-newer versions, this pin is worth revisiting.
+**`ERROR:__main__:FamDB data directory not found`** (from
+`run_repeatmasker_known_screen.log`) **is expected on a freshly-built env,
+not a bug** — a one-time manual setup step is required every time this
+conda env is rebuilt. `workflow/envs/repeatmasker.yaml` is floor-pinned to
+the latest release (`repeatmasker>=4.2.4`, same convention as
+`mafft>=7.487` elsewhere in this repo), and on that version chain the
+Dfam/FamDB library comes from a separate `famdb` conda package that —
+confirmed by reading `recipes/famdb/build.sh` in bioconda-recipes — ships
+only the `famdb.py` tool, no `*.h5` data at all. `-species` mode never
+works out of the box here, on any node, regardless of internet access.
 
-**Troubleshooting `ERROR:__main__:FamDB data directory not found`** (from
-`run_repeatmasker_known_screen.log`): with the 4.1.5 pin this should be
-rare — it means even the old-style `post-link.sh` download failed, most
-likely because the node that built/activated the conda env had no outbound
-internet at that moment (common for SGE compute nodes; login nodes more
-often have it). First try just rebuilding the env from a node with internet
-access. If that's not an option, fall back to manual setup: download a
-FamDB partition from `https://www.dfam.org/releases/current/families/FamDB/`
-(the curated-only partition is fastest to get unblocked with; the fuller
-partition set has more RepeatModeler-derived content, see below), transfer
-it to the cluster, then inside the conda env (`.snakemake/conda/<hash>/`,
-or wherever `--conda-prefix` points) run that install's own `configure`
-script with `-famdb_dir /path/to/downloaded/files`. This bakes the library
-path into that specific installation's config, so it persists across
-pipeline re-runs as long as the conda env itself isn't rebuilt (env yaml
-change, `--conda-cleanup-envs`, a fresh clone, or a different
-`--conda-prefix` all invalidate it).
+An older pin (`repeatmasker=4.1.5`, matching `vollgerlab/Rhodonite`'s
+already-working env on this cluster) was tried instead, since its
+`post-link.sh` downloads a library automatically. That was rejected after
+checking it directly: it's a frozen, pre-2023-schema single-file snapshot
+(curated-only, Dfam release 3.7) with two problems layered on top of each
+other — no uncurated/RepeatModeler-derived content (where species-specific
+families most likely live), and its own bundled `famdb.py` (v0.4.2)
+predates FamDB's schema changes in both v1.0 (Nov 2023) and v3.0.0
+(May 2026), so it **cannot read current-format files from dfam.org at
+all** even if you wanted to manually upgrade its library. Concretely, for
+zebra finch, `famdb.py -i <path-to-Dfam.h5> lineage -a "zebra finch"`
+against that 4.1.5-bundled library showed **every node from Aves down to
+the species itself at `[0]`** — Aves, Neognathae, Passeriformes,
+Passeroidea, Estrildidae, Estrildinae, Taeniopygia, Taeniopygia guttata,
+all zero; everything `-species` pulled in came from broad ancestor clades
+(Amniota, Vertebrata, Sauropsida) almost certainly dominated by unrelated
+model organisms. A clean `known_repeat_hits.tsv` result would have meant
+nothing against that library. Floor-pinning to latest costs a manual setup
+step but is the only path to current, full (curated+uncurated) data.
 
-**Confirmed limitation of the auto-downloaded library — check this for your
-own species before trusting a clean screen**: `repeatmasker=4.1.5`'s
-`post-link.sh` downloads a specific frozen snapshot — curated-only,
-Dfam release 3.7 (2023) — not the current Dfam release, and not the
-uncurated/RepeatModeler-derived content where species-specific families are
-most likely to actually live. For zebra finch specifically, this was
-checked directly and confirmed empty:
-```
-famdb.py -i <path-to-Dfam.h5> lineage -a "zebra finch"
-```
-showed **every node from Aves down to the species itself at `[0]`** —
-Aves, Neognathae, Passeriformes, Passeroidea, Estrildidae, Estrildinae,
-Taeniopygia, and Taeniopygia guttata are all zero. Everything `-species`
-would pull in comes from broad ancestor clades (Amniota, Vertebrata,
-Sauropsida) almost certainly dominated by unrelated model organisms. Run
-the same `lineage -a "<your species>"` check for whatever you're screening
-— a clean (`has_known_hit=False` everywhere) result against this library is
-not evidence of novelty if your lineage looks like this, only evidence that
-the library has nothing to compare against.
+**One-time setup** (per conda env build — repeat this if the env is ever
+rebuilt: env yaml change, `--conda-cleanup-envs`, a fresh clone, or a
+different `--conda-prefix` all invalidate it):
+1. Locate this rule's `famdb.py` and confirm its version first —
+   `famdb.py`'s own CLI has changed twice (schema v1.0 and v3.0.0); don't
+   assume flags from any documentation, including this README, match your
+   installed copy without checking `--help` yourself:
+   ```
+   <conda-env>/share/RepeatMasker/famdb.py info
+   ```
+2. Current Dfam (as of this pipeline's `repeatmasker>=4.2.4` pin) uses
+   FamDB format v3: 4 independently-partitioned components — Curated
+   Consensus (`cc`), Curated HMMs (`ch`), Uncurated Consensus (`uc`),
+   Uncurated HMMs (`uh`) — plus an always-required root file. From a
+   machine with internet access, download at least the root file from
+   `https://www.dfam.org/releases/current/families/FamDB/` into an empty
+   directory.
+3. Ask `famdb.py` itself which partition files you actually need, rather
+   than guessing filenames:
+   ```
+   famdb.py -i <dir> check "<species>"
+   ```
+   Download the `cc` + `uc` partitions it reports (consensus sequences,
+   what RepeatMasker's default rmblast search engine uses; `ch`/`uh` HMM
+   variants are only needed for higher-sensitivity nhmmer-based searches).
+4. Transfer everything to the cluster if it isn't already there, then
+   inside the conda env run that RepeatMasker install's own `configure`
+   script pointing at the directory: `-famdb_dir /path/to/downloaded/files`.
+   `run_repeatmasker_known_screen` already passes `-uncurated` to
+   RepeatMasker so that component actually gets searched, not just curated.
 
-**Getting real coverage**: current Dfam distributes FamDB as format v3,
-split into 4 independently-partitioned components — Curated Consensus
-(`cc`), Curated HMMs (`ch`), Uncurated Consensus (`uc`), Uncurated HMMs
-(`uh`) — plus an always-required root file. Rather than guess which
-partition files cover your species, use FamDB's own discovery command
-(after downloading at least the root file from
-`https://www.dfam.org/releases/current/families/FamDB/`):
-```
-famdb.py -i <dir> check "<species>"
-```
-which reports exactly which component/partition files are needed and
-whether each is already present locally. Download `cc` + `uc` at minimum
-(consensus sequences, what RepeatMasker's default rmblast search engine
-uses; the `ch`/`uh` HMM variants are only needed for higher-sensitivity
-nhmmer-based searches). Then point this env's own `configure` script at
-that directory the same way as the FamDB-not-found fallback above
-(`-famdb_dir /path/to/downloaded/files`) — this replaces the older
-single-file curated-only snapshot with the current, component-based
-library. `run_repeatmasker_known_screen` already passes `-uncurated` so
-that content actually gets searched once it's present, not just the
-curated subset.
+**Before trusting a clean screen as conclusive**, re-run the same lineage
+check against whatever you just configured —
+`famdb.py -i <dir> lineage -a "<species>"` — and confirm it isn't all
+zeros the way the 4.1.5 library was. A `has_known_hit=False` result is only
+informative if the library actually had something to compare against.
 
 ## `results/summary_table.tsv` columns
 
