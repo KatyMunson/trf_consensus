@@ -19,10 +19,14 @@
 #   5. cross_cluster_comparison — pairwise rotation/strand-aware comparison
 #      across EVERY cluster found (all bins, all ranks — including within
 #      the same bin), flagging near-identical or integer-multiple pairs.
-#   6. resolve_redundancy — groups flagged pairs (transitively) and keeps
-#      the highest-support cluster per group as the "winner"; others are
-#      kept but marked redundant (both in the summary table and in the
-#      RepeatMasker library's classification field) rather than dropped.
+#   6. resolve_redundancy — processes clusters in descending support order;
+#      each cluster is checked only against already-confirmed winners (never
+#      against another loser, never chained transitively through an
+#      intermediate). If flagged against a winner it's marked redundant with
+#      that winner specifically; otherwise it becomes a winner itself.
+#      Nothing is dropped — losers are kept in the summary table and the
+#      RepeatMasker library, marked redundant (both in the summary table and
+#      in the library's classification field), rather than removed.
 #
 # This requires Snakemake checkpoints (checkpoint scan_dat_candidates):
 # the bin list isn't known until the scan actually runs, so downstream rules

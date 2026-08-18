@@ -45,10 +45,14 @@ import argparse
 import itertools
 import random
 import sys
+from collections import defaultdict
 
 import edlib
 
-COMPLEMENT = str.maketrans("ACGTNacgtn", "TGCANtgcan")
+COMPLEMENT = str.maketrans(
+    "ACGTRYSWKMBDHVNacgtryswkmbdhvn",
+    "TGCAYRSWMKVHDBNtgcayrswmkvhdbn",
+)
 
 
 def revcomp(seq):
@@ -106,6 +110,14 @@ def tile_coverage(unit, target, min_identity, max_copies):
             identities.append(identity)
             for i in range(start, min(end + 1, len(working))):
                 working[i] = "N"
+                # `working` is the target doubled to support rotation, so
+                # every physical base appears at both i and its mirror i+/-n.
+                # Mask both, or an already-counted copy can be "found" again
+                # via its mirror image on a later iteration and inflate
+                # total_matched / n_copies_found for the same real bases.
+                mirror = i - n if i >= n else i + n
+                if 0 <= mirror < len(working):
+                    working[mirror] = "N"
             if total_matched >= n:
                 break
         coverage = min(total_matched / n, 1.0)
@@ -115,15 +127,91 @@ def tile_coverage(unit, target, min_identity, max_copies):
     return best
 
 
-def null_pass_count(unit, target, min_identity, max_copies, min_coverage, n_shuffles, rng):
-    """How many of n_shuffles mononucleotide-shuffled versions of `unit`
-    achieve >=min_coverage against the same target via the same tiling
-    procedure. Real matches should score far better than any shuffle."""
+def dinucleotide_shuffle(seq, rng, max_tries=100):
+    """Shuffle `seq` preserving its dinucleotide (and single-base)
+    composition, via the Altschul-Erikson (1985) edge-shuffle algorithm:
+    fix each character's LAST outgoing transition to what it was in the
+    original sequence (which guarantees, by construction, that every
+    character can still reach the sequence's final character by always
+    following its own fixed last edge), shuffle only the order of each
+    character's other outgoing transitions, then re-walk the graph.
+
+    EXPERIMENTAL: available via --shuffle-mode di but not the default —
+    mononucleotide shuffling only controls for single-base composition,
+    which can be too permissive a null for compositionally structured
+    satellite sequence (short internal runs, CpG depletion, etc). Needs
+    validation against the existing mononucleotide null on real data before
+    switching the pipeline default.
+    """
+    chars = list(seq)
+    if len(chars) < 3:
+        rng.shuffle(chars)
+        return "".join(chars)
+
+    last_char = chars[-1]
+    edges = defaultdict(list)
+    for i in range(len(chars) - 1):
+        edges[chars[i]].append(chars[i + 1])
+
+    def reachable_via_last_edge(shuffled):
+        for c, nxts in shuffled.items():
+            if c == last_char or not nxts:
+                continue
+            cur, seen = c, set()
+            while cur != last_char:
+                if cur in seen or cur not in shuffled or not shuffled[cur]:
+                    return False
+                seen.add(cur)
+                cur = shuffled[cur][-1]
+        return True
+
+    shuffled = None
+    for _ in range(max_tries):
+        candidate = {}
+        for c, nxts in edges.items():
+            if len(nxts) > 1:
+                head = nxts[:-1]
+                rng.shuffle(head)
+                candidate[c] = head + [nxts[-1]]
+            else:
+                candidate[c] = list(nxts)
+        if reachable_via_last_edge(candidate):
+            shuffled = candidate
+            break
+
+    if shuffled is None:
+        # The fixed-last-edge subgraph is connected to last_char by
+        # construction, so this should never actually trigger; fall back to
+        # a mononucleotide shuffle rather than fail the whole comparison.
+        rng.shuffle(chars)
+        return "".join(chars)
+
+    pos = {c: 0 for c in shuffled}
+    out = [chars[0]]
+    cur = chars[0]
+    for _ in range(len(chars) - 1):
+        nxt = shuffled[cur][pos[cur]]
+        pos[cur] += 1
+        out.append(nxt)
+        cur = nxt
+    return "".join(out)
+
+
+def null_pass_count(unit, target, min_identity, max_copies, min_coverage, n_shuffles, rng,
+                     shuffle_mode="mono"):
+    """How many of n_shuffles shuffled versions of `unit` achieve
+    >=min_coverage against the same target via the same tiling procedure.
+    Real matches should score far better than any shuffle. shuffle_mode
+    'mono' (default) preserves single-base composition only; 'di' preserves
+    dinucleotide composition too (see dinucleotide_shuffle)."""
     n_pass = 0
     unit_list = list(unit)
     for _ in range(n_shuffles):
-        rng.shuffle(unit_list)
-        shuffled = "".join(unit_list)
+        if shuffle_mode == "di":
+            shuffled = dinucleotide_shuffle(unit, rng)
+        else:
+            rng.shuffle(unit_list)
+            shuffled = "".join(unit_list)
         cov, _, _ = tile_coverage(shuffled, target, min_identity, max_copies)
         if cov >= min_coverage:
             n_pass += 1
@@ -149,6 +237,13 @@ def main():
                      help="A pair is only confirmed if at most this many of --n-shuffles shuffled "
                           "trials also clear --min-coverage. Default 0 = ALL shuffles must fail.")
     ap.add_argument("--shuffle-seed", type=int, default=1)
+    ap.add_argument("--shuffle-mode", choices=["mono", "di"], default="mono",
+                     help="EXPERIMENTAL, not yet wired into the Snakemake config — needs "
+                          "validation before switching the pipeline default. Null-model shuffle "
+                          "for the randomization test: 'mono' (default) preserves single-base "
+                          "composition only; 'di' is an Altschul-Erikson dinucleotide-preserving "
+                          "shuffle, a stricter null more appropriate for compositionally "
+                          "structured satellite sequence.")
     args = ap.parse_args()
 
     entries = read_multi_fasta(args.fastas)
@@ -186,7 +281,7 @@ def main():
             n_candidate_pairs += 1
             null_passes = null_pass_count(
                 seq_a, seq_b, args.min_identity, max_copies, args.min_coverage,
-                args.n_shuffles, rng
+                args.n_shuffles, rng, shuffle_mode=args.shuffle_mode
             )
             confirmed = null_passes <= args.max_null_passes
             flag_similar = confirmed and n_copies == 1
