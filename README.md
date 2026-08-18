@@ -322,13 +322,47 @@ pipeline re-runs as long as the conda env itself isn't rebuilt (env yaml
 change, `--conda-cleanup-envs`, a fresh clone, or a different
 `--conda-prefix` all invalidate it).
 
-**Worth checking before trusting a clean screen as conclusive**: even once
-FamDB is configured, the library that ships with a fresh install may itself
-be a smaller curated-only subset of Dfam, not the fullest available content
-(e.g. de novo species-specific libraries contributed separately) —
-`famdb.py ... lineage -c "<species>"` family counts are worth a look
-alongside the results here, independent of the specific-vs-broad species
-question above.
+**Confirmed limitation of the auto-downloaded library — check this for your
+own species before trusting a clean screen**: `repeatmasker=4.1.5`'s
+`post-link.sh` downloads a specific frozen snapshot — curated-only,
+Dfam release 3.7 (2023) — not the current Dfam release, and not the
+uncurated/RepeatModeler-derived content where species-specific families are
+most likely to actually live. For zebra finch specifically, this was
+checked directly and confirmed empty:
+```
+famdb.py -i <path-to-Dfam.h5> lineage -a "zebra finch"
+```
+showed **every node from Aves down to the species itself at `[0]`** —
+Aves, Neognathae, Passeriformes, Passeroidea, Estrildidae, Estrildinae,
+Taeniopygia, and Taeniopygia guttata are all zero. Everything `-species`
+would pull in comes from broad ancestor clades (Amniota, Vertebrata,
+Sauropsida) almost certainly dominated by unrelated model organisms. Run
+the same `lineage -a "<your species>"` check for whatever you're screening
+— a clean (`has_known_hit=False` everywhere) result against this library is
+not evidence of novelty if your lineage looks like this, only evidence that
+the library has nothing to compare against.
+
+**Getting real coverage**: current Dfam distributes FamDB as format v3,
+split into 4 independently-partitioned components — Curated Consensus
+(`cc`), Curated HMMs (`ch`), Uncurated Consensus (`uc`), Uncurated HMMs
+(`uh`) — plus an always-required root file. Rather than guess which
+partition files cover your species, use FamDB's own discovery command
+(after downloading at least the root file from
+`https://www.dfam.org/releases/current/families/FamDB/`):
+```
+famdb.py -i <dir> check "<species>"
+```
+which reports exactly which component/partition files are needed and
+whether each is already present locally. Download `cc` + `uc` at minimum
+(consensus sequences, what RepeatMasker's default rmblast search engine
+uses; the `ch`/`uh` HMM variants are only needed for higher-sensitivity
+nhmmer-based searches). Then point this env's own `configure` script at
+that directory the same way as the FamDB-not-found fallback above
+(`-famdb_dir /path/to/downloaded/files`) — this replaces the older
+single-file curated-only snapshot with the current, component-based
+library. `run_repeatmasker_known_screen` already passes `-uncurated` so
+that content actually gets searched once it's present, not just the
+curated subset.
 
 ## `results/summary_table.tsv` columns
 

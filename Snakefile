@@ -362,7 +362,14 @@ rule run_repeatmasker_known_screen:
         # parse_repeatmasker_hits.py treats as zero hits, not an error) —
         # but a genuine RepeatMasker crash (non-zero exit) still fails the
         # job normally, since `touch` is never reached.
-        "RepeatMasker -species '{params.species}' -pa {threads} "
+        # -uncurated: per RepeatMasker's own help text, it searches
+        # curated Dfam families only by default. The whole point of this
+        # screening step is maximum sensitivity to any prior
+        # characterization — curated or not (uncurated/RepeatModeler-
+        # derived families are where species-specific content most likely
+        # lives) — so there's no reason to withhold it here the way you
+        # might for whole-genome masking.
+        "RepeatMasker -species '{params.species}' -pa {threads} -uncurated "
         "-dir {params.outdir} {input} > {log} 2>&1 && touch {output}"
 
 
