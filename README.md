@@ -287,9 +287,28 @@ accepted approximation of the doubling trick, not something the parser
 tries to correct for, so treat a borderline or surprising top hit as worth
 a manual look rather than taking the score at face value.
 
-**Worth checking before trusting a clean screen as conclusive**: the
-RepeatMasker library that ships with a fresh install may itself be a
-smaller curated-only subset of Dfam, not the fullest available content
+**Troubleshooting `ERROR:__main__:FamDB data directory not found`** (from
+`run_repeatmasker_known_screen.log`): this means the conda-installed
+RepeatMasker has no Dfam FamDB library configured at all, not just a
+smaller-than-hoped-for one. bioconda's `repeatmasker` recipe normally
+auto-downloads a curated FamDB partition via a post-link script; on an SGE
+cluster this commonly fails silently because the node that builds/activates
+the conda env has no outbound internet. Fix: from a machine that does have
+internet, download a FamDB partition from
+`https://www.dfam.org/releases/current/families/FamDB/` (the curated-only
+partition is the fastest way to get unblocked; the fuller partition set has
+more RepeatModeler-derived content, see below), transfer it to the cluster,
+then inside the conda env (`.snakemake/conda/<hash>/`, or wherever
+`--conda-prefix` points) run that install's own `configure` script with
+`-famdb_dir /path/to/downloaded/files`. This bakes the library path into
+that specific installation's config, so it persists across pipeline
+re-runs as long as the conda env itself isn't rebuilt (env yaml change,
+`--conda-cleanup-envs`, a fresh clone, or a different `--conda-prefix` all
+invalidate it).
+
+**Worth checking before trusting a clean screen as conclusive**: even once
+FamDB is configured, the library that ships with a fresh install may itself
+be a smaller curated-only subset of Dfam, not the fullest available content
 (e.g. de novo species-specific libraries contributed separately) —
 `famdb.py ... lineage -c "<species>"` family counts are worth a look
 alongside the results here, independent of the specific-vs-broad species
