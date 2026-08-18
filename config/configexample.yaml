@@ -29,7 +29,15 @@ candidate_scan:
   min_copy_number: 100
   min_blocks: 5
   min_single_block_copy_number: 300
-  min_period_length: 150
+  min_period_length: 150 # HUMAN-CENTRIC DEFAULT, RECONSIDER PER SPECIES: 150 was picked to sit
+                          # just below human alpha-satellite (171bp) and exclude micro/mini-
+                          # satellites. It will categorically exclude any real, well-characterized
+                          # satellite family shorter than 150bp — some centromeric/pericentromeric
+                          # satellites in other taxa run well under this. If working with a
+                          # non-human genome, or if you're unsure what satellite periods to expect,
+                          # lower this for a permissive discovery pass and use total_array_bp /
+                          # mean_percent_match / mean_entropy in candidate_periods_raw.tsv to
+                          # triage the results rather than relying on this filter alone.
   window: 5              # +/- tolerance for both block-counting and extraction
   nms_radius: 5           # suppression radius so nearby period values don't get
                           # reported as separate candidates (see scan_dat_candidates.py)

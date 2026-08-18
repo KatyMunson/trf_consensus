@@ -158,9 +158,26 @@ block) any one locus with `copy_number ≥ min_single_block_copy_number`,
 regardless of block count — this catches a genuine large array TRF captured
 as one contiguous locus, which the distributed rule alone would reject.
 `min_period_length` filters out micro/mini-satellites before either rule is
-applied. `nms_radius` prevents nearby period values (TRF's period estimate
-jitters a few bp locus-to-locus for the same true repeat) from being
-reported as separate candidates.
+applied — its default (150) is a human-centric choice (just below alpha-
+satellite's 171bp); lower it for other taxa or a permissive discovery pass,
+see the comment in `config/configexample.yaml`. `nms_radius` prevents nearby
+period values (TRF's period estimate jitters a few bp locus-to-locus for the
+same true repeat) from being reported as separate candidates.
+
+**Known gap between the two `candidate_scan` rules:** a genuinely large
+satellite array that TRF fragments into many small-to-moderate blocks (e.g.
+a HOR array with enough internal degeneracy that no single block reaches
+`copy_number ≥ min_single_block_copy_number`, and no individual block
+reaches `copy_number ≥ min_copy_number` either) can fall through *both*
+rules even though `min_blocks` is satisfied many times over — the
+distributed rule requires at least one block to individually clear
+`min_copy_number`, not just that the blocks collectively represent a lot of
+sequence. If you suspect this is happening for a period you expected to see,
+check `total_array_bp` for that period in `candidate_periods_raw.tsv` (every
+eligible period's own stats, unsuppressed) — a large `total_array_bp` with
+`passes_filters=False` is the signature of this gap, and lowering
+`min_copy_number` (rather than `min_blocks`, which is likely already being
+met) is the fix.
 
 **`cluster_ranking`** — `min_cluster_size` (default 3) is the floor for a
 peeled-off group to count as a real cluster; `max_rounds` (default 15) is a
