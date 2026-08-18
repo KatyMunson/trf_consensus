@@ -275,18 +275,38 @@ library format) → `run_repeatmasker_known_screen` (RepeatMasker itself) →
   real match wraps around the end of a single un-doubled copy. Same trick
   used internally elsewhere in this pipeline (`cross_motif_comparison.py`).
 
-**Reading `known_repeat_hits.tsv`**: one row per cluster `label` (same join
-key as `summary_table.tsv`), always present whether or not RepeatMasker
-found anything — `has_known_hit=False` with the rest of the columns `NA` is
-a normal, common, and often the *expected* outcome, not a failure: much of
-the satellite DNA in a non-model species genome is genuinely undescribed in
-existing databases. When `has_known_hit=True`, `repeat_name` /
-`repeat_class_family` identify the match, and `sw_score` /
-`pct_divergence` describe its quality. If a query was doubled, a real match
-that happens to span the artificial doubling junction can produce an
-inflated or split-looking score right at that boundary — this is an
-accepted approximation of the doubling trick, not something the parser
-tries to correct for, so treat a borderline or surprising top hit as worth
+**Reading `known_repeat_hits.tsv`**: every cluster `label` (same join key
+as `summary_table.tsv`) is present, but **this is not guaranteed to be one
+row per label** — a label with no hit gets exactly one row
+(`has_known_hit=False`, rest `NA`), a normal, common, and often *expected*
+outcome, not a failure (much of the satellite DNA in a non-model species
+genome is genuinely undescribed in existing databases); a label with hits
+gets **one row per distinct matched repeat name**, so a motif that matches
+two unrelated known families shows up as two rows. If you need exactly one
+row per label (e.g. for a simple join), sort by `reciprocal_overlap`
+descending and keep the first row per label. `repeat_name` /
+`repeat_class_family` identify each match, `sw_score` / `pct_divergence`
+describe its quality, and:
+- `pct_query_covered` — fraction of *your* motif's true (pre-doubling)
+  length this hit explains, capped at 1.0 so a hit wrapping into the
+  second copy of a doubled query can't nonsensically exceed 100%.
+- `pct_known_repeat_covered` — fraction of the *matched repeat family's
+  own* model/consensus length this hit explains, from RepeatMasker's own
+  "position in repeat" columns.
+- `reciprocal_overlap` — `min()` of the two above; both sequences must be
+  substantially explained for this to be high, so it's the number to sort/
+  filter on if you want to distinguish "your motif basically *is* this
+  known repeat" from "your motif happens to embed a small fragment of it"
+  or "this known repeat happens to be one small piece of your much larger
+  motif" (either of those shows up as one of the two individual percentages
+  being high while the other is low).
+
+If a query was doubled, a real match that happens to span the artificial
+doubling junction can produce an inflated or split-looking raw `sw_score`
+right at that boundary — this is an accepted approximation of the doubling
+trick that only `pct_query_covered` corrects for (by capping), not
+`sw_score`/`pct_divergence`/etc., which are reported exactly as
+RepeatMasker output them. Treat a borderline or surprising top hit as worth
 a manual look rather than taking the score at face value.
 
 **`ERROR:__main__:FamDB data directory not found`** (from
