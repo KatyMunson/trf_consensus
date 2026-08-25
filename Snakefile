@@ -19,10 +19,28 @@
 #   5. cross_cluster_comparison — pairwise rotation/strand-aware comparison
 #      across EVERY cluster found (all bins, all ranks — including within
 #      the same bin), flagging near-identical or integer-multiple pairs.
-#   6. resolve_redundancy — groups flagged pairs (transitively) and keeps
-#      the highest-support cluster per group as the "winner"; others are
-#      kept but marked redundant (both in the summary table and in the
-#      RepeatMasker library's classification field) rather than dropped.
+#   6. resolve_redundancy — processes clusters in descending support order;
+#      each cluster is checked only against already-confirmed winners (never
+#      against another loser, never chained transitively through an
+#      intermediate). If flagged against a winner it's marked redundant with
+#      that winner specifically; otherwise it becomes a winner itself.
+#      Nothing is dropped — losers are kept in the summary table and the
+#      RepeatMasker library, marked redundant (both in the summary table and
+#      in the library's classification field), rather than removed.
+#   7. known-repeat screening (prepare_known_repeat_query ->
+#      run_repeatmasker_known_screen -> parse_known_repeat_hits) — runs
+#      RepeatMasker -species against OUR OWN discovered consensus motifs
+#      (not the assembly) to check whether any match a previously
+#      characterized repeat family in Dfam/RepBase. A targeted, much
+#      cheaper "is this already known" check than screening the whole
+#      assembly. Uses a fresh, pipeline-owned RepeatMasker install (conda
+#      only, see workflow/envs/repeatmasker.yaml — floor-pinned to the
+#      latest release. The FamDB library it needs does NOT come bundled or
+#      auto-downloaded on this version chain, so the first run after a
+#      fresh env build will fail with "FamDB data directory not found" —
+#      this is expected, not a bug; see the README's "Known-repeat
+#      screening" section for the one-time manual setup), independent of
+#      whatever version/library may already be on the cluster.
 #
 # This requires Snakemake checkpoints (checkpoint scan_dat_candidates):
 # the bin list isn't known until the scan actually runs, so downstream rules
@@ -36,6 +54,8 @@
 # Author:  KM
 # Created: 2026-08
 # =============================================================================
+
+import os
 
 wildcard_constraints:
     motif="[^/]+",
@@ -80,7 +100,8 @@ def all_motif_windows(wildcards):
 rule all:
     input:
         "results/repeatmasker_custom_lib.fasta",
-        "results/summary_table.tsv"
+        "results/summary_table.tsv",
+        "results/known_repeat_hits.tsv"
 
 
 checkpoint scan_dat_candidates:
@@ -276,3 +297,119 @@ rule resolve_redundancy:
         "--consensus-fasta {input.consensus_fasta} "
         "--classification {config[repeatmasker_classification]} "
         "--out-lib-fasta {output.lib_fasta} --out-summary {output.summary} > {log} 2>&1"
+
+
+# --- Step 7: known-repeat screening ---
+# Screens our own discovered consensus motifs (not the assembly) against a
+# Dfam/RepBase library via RepeatMasker -species, to check whether any
+# match a previously characterized repeat family.
+
+rule prepare_known_repeat_query:
+    # Strips our own #classification suffix down to the bare label (our
+    # own metadata, not a valid RepeatMasker query name, and "#" has
+    # special meaning in RepeatMasker's own library format) and optionally
+    # doubles each sequence so a database entry starting at a different
+    # rotation phase can still align end-to-end.
+    input:
+        "results/repeatmasker_custom_lib.fasta"
+    output:
+        "results/known_repeat_screen/query.fasta"
+    params:
+        double_flag=lambda wc: "--double" if config["known_repeat_screen"]["double_sequences"] else ""
+    log:
+        "results/logs/prepare_known_repeat_query.log"
+    threads: config["resources"]["prepare_known_repeat_query"]["threads"]
+    resources:
+        mem=lambda wildcards, attempt: config["resources"]["prepare_known_repeat_query"]["mem"] * attempt,
+        hrs=config["resources"]["prepare_known_repeat_query"]["hrs"]
+    conda:
+        "workflow/envs/python_base.yaml"
+    envmodules:
+        "python/3.11"
+    shell:
+        "python workflow/scripts/prepare_known_repeat_query.py "
+        "--in-fasta {input} --out-fasta {output} {params.double_flag} > {log} 2>&1"
+
+
+rule run_repeatmasker_known_screen:
+    # Deliberately conda-only, no envmodules: fallback — unlike every other
+    # rule in this pipeline. The point of this rule is a fresh,
+    # pipeline-owned RepeatMasker install, its own bundled library, not
+    # reuse of whatever version/library happens to already be on the
+    # cluster. Requires a one-time manual FamDB download-and-configure step
+    # per env build — see workflow/envs/repeatmasker.yaml and the README's
+    # "Known-repeat screening" section.
+    input:
+        "results/known_repeat_screen/query.fasta"
+    output:
+        "results/known_repeat_screen/query.fasta.out"
+    params:
+        species=config["known_repeat_screen"]["species"],
+        outdir="results/known_repeat_screen",
+        input_abs=lambda wc, input: os.path.abspath(input[0])
+    log:
+        "results/logs/run_repeatmasker_known_screen.log"
+    threads: config["resources"]["run_repeatmasker_known_screen"]["threads"]
+    resources:
+        mem=lambda wildcards, attempt: config["resources"]["run_repeatmasker_known_screen"]["mem"] * attempt,
+        hrs=config["resources"]["run_repeatmasker_known_screen"]["hrs"]
+    conda:
+        "workflow/envs/repeatmasker.yaml"
+    shell:
+        # RepeatMasker can decline to write a .out file at all when nothing
+        # anywhere in the query matches anything in the library (a
+        # completely plausible outcome for undescribed satellite DNA) —
+        # RepeatMasker still exits 0 in that case, it just doesn't create
+        # the file. `&& touch {output}` guarantees the declared output
+        # exists whenever RepeatMasker itself succeeded, so Snakemake
+        # doesn't fail the job on a legitimate zero-hit result (which
+        # parse_repeatmasker_hits.py treats as zero hits, not an error) —
+        # but a genuine RepeatMasker crash (non-zero exit) still fails the
+        # job normally, since `touch` is never reached.
+        # -uncurated: per RepeatMasker's own help text, it searches
+        # curated Dfam families only by default. The whole point of this
+        # screening step is maximum sensitivity to any prior
+        # characterization — curated or not (uncurated/RepeatModeler-
+        # derived families are where species-specific content most likely
+        # lives) — so there's no reason to withhold it here the way you
+        # might for whole-genome masking.
+        # `cd {params.outdir}` + trap: RepeatMasker's own source
+        # (createTempDir()) creates its RM_<pid>.<timestamp> scratch
+        # directory relative to the process's actual cwd, always — `-dir`
+        # is only ever consulted as a fallback if writing to cwd fails
+        # outright, so without this it litters the repo root (Snakemake
+        # jobs run with cwd = the Snakefile's directory) on every
+        # invocation. RepeatMasker does self-delete it, but only via the
+        # very last line of its main script (`rm -R $tempdir unless
+        # $DEBUG`) — any crash/die anywhere earlier skips that entirely.
+        # cd'ing into -dir first at least contains any leftover debris
+        # inside results/known_repeat_screen/ instead of the repo root; the
+        # trap goes further and guarantees cleanup here even when
+        # RepeatMasker itself fails, which its own logic does not.
+        "(cd {params.outdir} && trap 'rm -rf RM_*' EXIT && "
+        "RepeatMasker -species '{params.species}' -pa {threads} -uncurated "
+        "-dir . {params.input_abs}) > {log} 2>&1 && touch {output}"
+
+
+rule parse_known_repeat_hits:
+    input:
+        rm_out="results/known_repeat_screen/query.fasta.out",
+        query_fasta="results/known_repeat_screen/query.fasta"
+    output:
+        "results/known_repeat_hits.tsv"
+    params:
+        doubled_flag=lambda wc: "--doubled" if config["known_repeat_screen"]["double_sequences"] else ""
+    log:
+        "results/logs/parse_known_repeat_hits.log"
+    threads: config["resources"]["parse_known_repeat_hits"]["threads"]
+    resources:
+        mem=lambda wildcards, attempt: config["resources"]["parse_known_repeat_hits"]["mem"] * attempt,
+        hrs=config["resources"]["parse_known_repeat_hits"]["hrs"]
+    conda:
+        "workflow/envs/python_base.yaml"
+    envmodules:
+        "python/3.11"
+    shell:
+        "python workflow/scripts/parse_repeatmasker_hits.py "
+        "--rm-out {input.rm_out} --query-fasta {input.query_fasta} --out-tsv {output} "
+        "{params.doubled_flag} > {log} 2>&1"

@@ -1,0 +1,20 @@
+name: trf_consensus_repeatmasker
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  # Floor-pinned to the latest release, same convention as mafft>=7.487
+  # elsewhere in this repo. bioconda's repeatmasker>=4.2.4 gets its Dfam/
+  # FamDB library from a separate `famdb` conda package that ships the
+  # famdb.py TOOL but no *.h5 DATA — so the first run after a fresh env
+  # build will fail with "FamDB data directory not found." This is
+  # expected, not a bug: see the README's "Known-repeat screening" section
+  # for the one-time manual download-and-configure step. This is the only
+  # path to current, full (curated+uncurated) Dfam data — the alternative
+  # (pinning to an older release like 4.1.5 for its automatic but ancient,
+  # curated-only, pre-2023-schema library) was tried and rejected: that
+  # library's bundled famdb.py can't even read current-format dfam.org
+  # files, and was confirmed empty across the entire Aves lineage for a
+  # real test species.
+  - repeatmasker>=4.2.4

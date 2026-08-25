@@ -130,13 +130,25 @@ Edit `config/config.yaml`:
 - **Verify the MAFFT module name** — `rank_family_clusters` requests
   `mafft/7.487` via `envmodules:`. Run `module avail mafft` on liger and
   update the Snakefile if the version differs.
+- `known_repeat_screen.species`: the RepeatMasker `-species` value to
+  screen discovered motifs against (see "Known-repeat screening" below).
 
 ## Run
 
 ```bash
 snakemake -s Snakefile --configfile config/config.yaml \
-    --cores 48 --use-envmodules --retries 3
+    --cores 48 --use-envmodules --use-conda --retries 3
 ```
+
+**Both `--use-envmodules` and `--use-conda` are required together** — every
+rule but one uses envmodules (matching the rest of this pipeline's
+cluster-module setup), but `run_repeatmasker_known_screen` deliberately has
+no `envmodules:` fallback (it installs its own fresh, pipeline-owned
+RepeatMasker via conda rather than reusing whatever's already on the
+cluster — see "Known-repeat screening" below). Passing both flags lets
+Snakemake use envmodules wherever a rule defines them and fall back to
+conda for that one rule; passing `--use-envmodules` alone would run
+RepeatMasker with no environment management at all.
 
 (Swap `--use-envmodules` for `--use-conda` to run off the per-rule envs in
 `workflow/envs/` instead: `python_base.yaml` for pure-Python rules,
@@ -158,9 +170,26 @@ block) any one locus with `copy_number ≥ min_single_block_copy_number`,
 regardless of block count — this catches a genuine large array TRF captured
 as one contiguous locus, which the distributed rule alone would reject.
 `min_period_length` filters out micro/mini-satellites before either rule is
-applied. `nms_radius` prevents nearby period values (TRF's period estimate
-jitters a few bp locus-to-locus for the same true repeat) from being
-reported as separate candidates.
+applied — its default (150) is a human-centric choice (just below alpha-
+satellite's 171bp); lower it for other taxa or a permissive discovery pass,
+see the comment in `config/configexample.yaml`. `nms_radius` prevents nearby
+period values (TRF's period estimate jitters a few bp locus-to-locus for the
+same true repeat) from being reported as separate candidates.
+
+**Known gap between the two `candidate_scan` rules:** a genuinely large
+satellite array that TRF fragments into many small-to-moderate blocks (e.g.
+a HOR array with enough internal degeneracy that no single block reaches
+`copy_number ≥ min_single_block_copy_number`, and no individual block
+reaches `copy_number ≥ min_copy_number` either) can fall through *both*
+rules even though `min_blocks` is satisfied many times over — the
+distributed rule requires at least one block to individually clear
+`min_copy_number`, not just that the blocks collectively represent a lot of
+sequence. If you suspect this is happening for a period you expected to see,
+check `total_array_bp` for that period in `candidate_periods_raw.tsv` (every
+eligible period's own stats, unsuppressed) — a large `total_array_bp` with
+`passes_filters=False` is the signature of this gap, and lowering
+`min_copy_number` (rather than `min_blocks`, which is likely already being
+met) is the fix.
 
 **`cluster_ranking`** — `min_cluster_size` (default 3) is the floor for a
 peeled-off group to count as a real cluster; `max_rounds` (default 15) is a
@@ -176,6 +205,10 @@ fraction of the longer sequence that must be explained by tiled copies;
 `n_shuffles` (20) and `max_null_passes` (0) control the randomization
 significance test — raise `max_null_passes` above 0 only if you want a more
 permissive (less strict) confirmation criterion.
+
+**`known_repeat_screen`** — `species` is the RepeatMasker `-species` value;
+`double_sequences` (default true) controls the rotation-tolerant doubling
+trick. See "Known-repeat screening" below for the full rationale.
 
 ## Outputs
 
@@ -196,6 +229,169 @@ permissive (less strict) confirmation criterion.
   `>{label}#{classification}/redundant_with_{winner}` (demoted)
 - `results/summary_table.tsv` — **final output**: `all_clusters.tsv` plus
   `is_redundant` / `redundant_with` / `group_size`
+- `results/known_repeat_hits.tsv` — **final output**: every cluster's
+  `label` joined against a Dfam/RepBase known-repeat screen, see
+  "Known-repeat screening" below
+
+## Known-repeat screening
+
+A separate, final step screens our own discovered consensus motifs (not
+the genome assembly) against a Dfam/RepBase library, via
+`RepeatMasker -species`, to check whether any of them match a previously
+characterized/named repeat family. This answers a narrower, more direct
+question than running RepeatMasker against the whole assembly — "is this
+specific candidate we found already known?" — and is much cheaper: ~100-250
+short sequences, well under a minute of actual RepeatMasker runtime
+regardless of library size, versus screening an entire genome.
+
+This step runs on `results/repeatmasker_custom_lib.fasta` (the final
+output — every cluster, winners and redundancy-demoted ones both, since a
+demoted cluster individually matching a known family is still useful
+information) and is wired into `rule all` alongside the other final
+outputs, consistent with this pipeline's fully-automatic design — there's
+no separate flag to opt in or out.
+
+**Pipeline**: `prepare_known_repeat_query` (strips our own
+`#classification` suffix off each header, since it's not a valid
+RepeatMasker query name and `#` has special meaning in RepeatMasker's own
+library format) → `run_repeatmasker_known_screen` (RepeatMasker itself) →
+`parse_known_repeat_hits` (turns the `.out` file into
+`results/known_repeat_hits.tsv`).
+
+`run_repeatmasker_known_screen` runs RepeatMasker from inside
+`results/known_repeat_screen/`, not the repo root — RepeatMasker's own
+`RM_<pid>.<timestamp>` scratch directory is always created relative to the
+process's actual working directory (confirmed by reading its source,
+`createTempDir()`; `-dir` is only ever consulted as a fallback if writing
+to cwd fails outright), so without this it would litter the repo root on
+every invocation. RepeatMasker does normally self-delete its own scratch
+dir, but only via the very last line of its main script — any crash or
+interruption anywhere earlier skips that entirely, which is why you may
+still see a stray `RM_*` directory after a failed run despite this. The
+rule also traps on exit to remove it regardless of success or failure, so
+this should be rare going forward; any that are still lying around from
+before this fix are safe to delete by hand
+(`rm -rf results/known_repeat_screen/RM_*` — or, from old runs before this
+was contained to that directory, `rm -rf RM_*` in the repo root).
+
+**Config** (`known_repeat_screen` in `config/config.yaml`):
+- `species` — the RepeatMasker `-species` value. Per FamDB's own docs,
+  specifying a species pulls its entire ancestor lineage automatically
+  (e.g. Aves, Neognathae, ... all inherited) plus any species-specific
+  curated/de novo content filed at that node — specificity is additive
+  here, not narrowing, so use the most specific available relative. Before
+  relying on a species value, check what's actually populated with
+  `famdb.py -i <path-to-famdb> lineage -a "<species>"` (verify the exact
+  flag against your installed `famdb.py --help`; this has changed across
+  versions — see "One-time setup" below).
+- `double_sequences` — concatenates each consensus to itself before
+  screening (`seq+seq`), so a database entry that starts at a different
+  rotation phase than our consensus can still align end-to-end against a
+  contiguous stretch of the query, instead of being missed because the
+  real match wraps around the end of a single un-doubled copy. Same trick
+  used internally elsewhere in this pipeline (`cross_motif_comparison.py`).
+
+**Reading `known_repeat_hits.tsv`**: every cluster `label` (same join key
+as `summary_table.tsv`) is present, but **this is not guaranteed to be one
+row per label** — a label with no hit gets exactly one row
+(`has_known_hit=False`, rest `NA`), a normal, common, and often *expected*
+outcome, not a failure (much of the satellite DNA in a non-model species
+genome is genuinely undescribed in existing databases); a label with hits
+gets **one row per distinct matched repeat name**, so a motif that matches
+two unrelated known families shows up as two rows. If you need exactly one
+row per label (e.g. for a simple join), sort by `reciprocal_overlap`
+descending and keep the first row per label. `repeat_name` /
+`repeat_class_family` identify each match, `sw_score` / `pct_divergence`
+describe its quality, and:
+- `pct_query_covered` — fraction of *your* motif's true (pre-doubling)
+  length this hit explains, capped at 1.0 so a hit wrapping into the
+  second copy of a doubled query can't nonsensically exceed 100%.
+- `pct_known_repeat_covered` — fraction of the *matched repeat family's
+  own* model/consensus length this hit explains, from RepeatMasker's own
+  "position in repeat" columns.
+- `reciprocal_overlap` — `min()` of the two above; both sequences must be
+  substantially explained for this to be high, so it's the number to sort/
+  filter on if you want to distinguish "your motif basically *is* this
+  known repeat" from "your motif happens to embed a small fragment of it"
+  or "this known repeat happens to be one small piece of your much larger
+  motif" (either of those shows up as one of the two individual percentages
+  being high while the other is low).
+
+If a query was doubled, a real match that happens to span the artificial
+doubling junction can produce an inflated or split-looking raw `sw_score`
+right at that boundary — this is an accepted approximation of the doubling
+trick that only `pct_query_covered` corrects for (by capping), not
+`sw_score`/`pct_divergence`/etc., which are reported exactly as
+RepeatMasker output them. Treat a borderline or surprising top hit as worth
+a manual look rather than taking the score at face value.
+
+**`ERROR:__main__:FamDB data directory not found`** (from
+`run_repeatmasker_known_screen.log`) **is expected on a freshly-built env,
+not a bug** — a one-time manual setup step is required every time this
+conda env is rebuilt. `workflow/envs/repeatmasker.yaml` is floor-pinned to
+the latest release (`repeatmasker>=4.2.4`, same convention as
+`mafft>=7.487` elsewhere in this repo), and on that version chain the
+Dfam/FamDB library comes from a separate `famdb` conda package that —
+confirmed by reading `recipes/famdb/build.sh` in bioconda-recipes — ships
+only the `famdb.py` tool, no `*.h5` data at all. `-species` mode never
+works out of the box here, on any node, regardless of internet access.
+
+An older pin (`repeatmasker=4.1.5`, matching `vollgerlab/Rhodonite`'s
+already-working env on this cluster) was tried instead, since its
+`post-link.sh` downloads a library automatically. That was rejected after
+checking it directly: it's a frozen, pre-2023-schema single-file snapshot
+(curated-only, Dfam release 3.7) with two problems layered on top of each
+other — no uncurated/RepeatModeler-derived content (where species-specific
+families most likely live), and its own bundled `famdb.py` (v0.4.2)
+predates FamDB's schema changes in both v1.0 (Nov 2023) and v3.0.0
+(May 2026), so it **cannot read current-format files from dfam.org at
+all** even if you wanted to manually upgrade its library. Concretely, for
+zebra finch, `famdb.py -i <path-to-Dfam.h5> lineage -a "zebra finch"`
+against that 4.1.5-bundled library showed **every node from Aves down to
+the species itself at `[0]`** — Aves, Neognathae, Passeriformes,
+Passeroidea, Estrildidae, Estrildinae, Taeniopygia, Taeniopygia guttata,
+all zero; everything `-species` pulled in came from broad ancestor clades
+(Amniota, Vertebrata, Sauropsida) almost certainly dominated by unrelated
+model organisms. A clean `known_repeat_hits.tsv` result would have meant
+nothing against that library. Floor-pinning to latest costs a manual setup
+step but is the only path to current, full (curated+uncurated) data.
+
+**One-time setup** (per conda env build — repeat this if the env is ever
+rebuilt: env yaml change, `--conda-cleanup-envs`, a fresh clone, or a
+different `--conda-prefix` all invalidate it):
+1. Locate this rule's `famdb.py` and confirm its version first —
+   `famdb.py`'s own CLI has changed twice (schema v1.0 and v3.0.0); don't
+   assume flags from any documentation, including this README, match your
+   installed copy without checking `--help` yourself:
+   ```
+   <conda-env>/share/RepeatMasker/famdb.py info
+   ```
+2. Current Dfam (as of this pipeline's `repeatmasker>=4.2.4` pin) uses
+   FamDB format v3: 4 independently-partitioned components — Curated
+   Consensus (`cc`), Curated HMMs (`ch`), Uncurated Consensus (`uc`),
+   Uncurated HMMs (`uh`) — plus an always-required root file. From a
+   machine with internet access, download at least the root file from
+   `https://www.dfam.org/releases/current/families/FamDB/` into an empty
+   directory.
+3. Ask `famdb.py` itself which partition files you actually need, rather
+   than guessing filenames:
+   ```
+   famdb.py -i <dir> check "<species>"
+   ```
+   Download the `cc` + `uc` partitions it reports (consensus sequences,
+   what RepeatMasker's default rmblast search engine uses; `ch`/`uh` HMM
+   variants are only needed for higher-sensitivity nhmmer-based searches).
+4. Transfer everything to the cluster if it isn't already there, then
+   inside the conda env run that RepeatMasker install's own `configure`
+   script pointing at the directory: `-famdb_dir /path/to/downloaded/files`.
+   `run_repeatmasker_known_screen` already passes `-uncurated` to
+   RepeatMasker so that component actually gets searched, not just curated.
+
+**Before trusting a clean screen as conclusive**, re-run the same lineage
+check against whatever you just configured —
+`famdb.py -i <dir> lineage -a "<species>"` — and confirm it isn't all
+zeros the way the 4.1.5 library was. A `has_known_hit=False` result is only
+informative if the library actually had something to compare against.
 
 ## `results/summary_table.tsv` columns
 

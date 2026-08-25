@@ -29,7 +29,15 @@ candidate_scan:
   min_copy_number: 100
   min_blocks: 5
   min_single_block_copy_number: 300
-  min_period_length: 150
+  min_period_length: 150 # HUMAN-CENTRIC DEFAULT, RECONSIDER PER SPECIES: 150 was picked to sit
+                          # just below human alpha-satellite (171bp) and exclude micro/mini-
+                          # satellites. It will categorically exclude any real, well-characterized
+                          # satellite family shorter than 150bp — some centromeric/pericentromeric
+                          # satellites in other taxa run well under this. If working with a
+                          # non-human genome, or if you're unsure what satellite periods to expect,
+                          # lower this for a permissive discovery pass and use total_array_bp /
+                          # mean_percent_match / mean_entropy in candidate_periods_raw.tsv to
+                          # triage the results rather than relying on this filter alone.
   window: 5              # +/- tolerance for both block-counting and extraction
   nms_radius: 5           # suppression radius so nearby period values don't get
                           # reported as separate candidates (see scan_dat_candidates.py)
@@ -57,6 +65,33 @@ cross_cluster_comparison:
   max_null_passes: 0           # a pair is only confirmed if at most this many shuffled trials also pass
                                 # min_coverage (default 0 = ALL shuffles must fail to confirm real signal)
 
+# --- Step 4: known-repeat screening (results/known_repeat_hits.tsv) ---
+# Runs RepeatMasker with -species against our OWN discovered consensus
+# motifs (not the assembly) to check whether any match a previously
+# characterized repeat family in Dfam/RepBase. Much cheaper and more
+# targeted than screening the whole assembly: ~100-250 short sequences,
+# well under a minute of actual RepeatMasker runtime regardless of library
+# size.
+known_repeat_screen:
+  species: "zebra finch"  # RepeatMasker -species value. Per FamDB's own docs, specifying a
+                      # species pulls its ENTIRE ancestor lineage automatically (Aves,
+                      # Neognathae, etc. all inherited) PLUS any species-specific
+                      # curated/de novo content filed at that node specifically —
+                      # specificity is additive here, not narrowing, so there's no downside
+                      # to using the most specific available relative rather than a broad
+                      # clade name. Before committing, check what's actually populated with:
+                      #   famdb.py -i <path-to-famdb> lineage -a "zebra finch"
+                      # (verify the exact flag against your installed famdb.py --help first —
+                      # this has changed across FamDB versions; see README's "Known-repeat
+                      # screening" section). Shows family counts at each taxonomic level in the
+                      # lineage — if zero are lineage-specific to zebra finch, querying "aves"
+                      # would be equivalent).
+  double_sequences: true  # concatenate each consensus to itself before screening, so a
+                           # database entry starting at a different rotation phase can still
+                           # align end-to-end against a contiguous stretch of the query. Same
+                           # trick used internally elsewhere in this pipeline (see
+                           # cross_motif_comparison.py).
+
 resources:
   scan_dat_candidates:
     threads: 1
@@ -83,6 +118,18 @@ resources:
     mem: 2
     hrs: 4
   resolve_redundancy:
+    threads: 1
+    mem: 2
+    hrs: 1
+  prepare_known_repeat_query:
+    threads: 1
+    mem: 2
+    hrs: 1
+  run_repeatmasker_known_screen:
+    threads: 4
+    mem: 8
+    hrs: 2
+  parse_known_repeat_hits:
     threads: 1
     mem: 2
     hrs: 1
