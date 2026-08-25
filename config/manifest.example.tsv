@@ -1,0 +1,5 @@
+entry_id	individual	assembly_method	phasing_status	fasta_paths	trf_dat_paths
+WEME01_hifiasm	WEME01	hifiasm	phased_pooled	/data/WEME01/hifiasm/hap1.fasta;/data/WEME01/hifiasm/hap2.fasta	/data/WEME01/hifiasm/hap1.trf.dat;/data/WEME01/hifiasm/hap2.trf.dat
+WEME01_verkko	WEME01	verkko	unphased	/data/WEME01/verkko/asm.fasta	/data/WEME01/verkko/asm.trf.dat
+WEME02_hifiasm	WEME02	hifiasm	phased_pooled	/data/WEME02/hifiasm/hap1.fasta;/data/WEME02/hifiasm/hap2.fasta	/data/WEME02/hifiasm/hap1.trf.dat;/data/WEME02/hifiasm/hap2.trf.dat
+WEME02_ont_only	WEME02	ont_only	phased_pooled	/data/WEME02/ont/hap1.fasta;/data/WEME02/ont/hap2.fasta	/data/WEME02/ont/hap1.trf.dat;/data/WEME02/ont/hap2.trf.dat

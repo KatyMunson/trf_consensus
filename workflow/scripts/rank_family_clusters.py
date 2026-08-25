@@ -31,7 +31,11 @@ cluster isn't practical here).
 Outputs, all inside --out-dir:
   rank01_n<N>.fasta, rank02_n<N>.fasta, ... — one consensus per cluster,
     header ">{motif_name}_rank{rank}_n{N} n_input_sequences=N consensus_length=L"
-  --out-summary: one row per cluster, sorted by rank
+  --out-summary: one row per cluster, sorted by rank. Includes
+    total_copy_number: the sum of raw TRF copy_number (from --in-tsv) across
+    every locus that peeled into that cluster — the per-entry support metric
+    used for filtering/ranking downstream, distinct from n_input_sequences
+    (a locus count, not a copy-number-weighted one).
 """
 import argparse
 import os
@@ -53,6 +57,22 @@ ANCHOR_START_OFFSETS = [0.5, 0.25, 0.75, 0.1, 0.9]
 
 def revcomp(seq):
     return seq.translate(COMPLEMENT)[::-1]
+
+
+def read_copy_numbers(path):
+    """Parse a 01_raw_consensus.tsv (extract_by_period.py's output) into
+    {id: copy_number}, for summing per cluster after peeling."""
+    copy_numbers = {}
+    with open(path) as f:
+        header = f.readline().rstrip("\n").split("\t")
+        id_col = header.index("id")
+        cn_col = header.index("copy_number")
+        for line in f:
+            if not line.strip():
+                continue
+            fields = line.rstrip("\n").split("\t")
+            copy_numbers[fields[id_col]] = float(fields[cn_col])
+    return copy_numbers
 
 
 def read_fasta(path):
@@ -220,6 +240,9 @@ def majority_consensus(aligned_fasta_text, max_gap_fraction, rng=None):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--in-fasta", required=True, help="01_raw_consensus.fasta for one motif bin")
+    ap.add_argument("--in-tsv", required=True,
+                     help="01_raw_consensus.tsv for the same bin, for per-locus copy_number "
+                          "lookup when summing total_copy_number per cluster")
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--out-summary", required=True)
     ap.add_argument("--motif-name", required=True)
@@ -255,6 +278,7 @@ def main():
     consensus_rng = random.Random(args.consensus_tie_seed)
 
     records = read_fasta(args.in_fasta)
+    copy_numbers = read_copy_numbers(args.in_tsv)
     n_total = len(records)
     sys.stderr.write(f"[rank_family_clusters] {args.motif_name}: {n_total} input sequences\n")
 
@@ -314,18 +338,29 @@ def main():
             f.write(f">{label} n_input_sequences={len(cluster)} consensus_length={len(consensus)}\n")
             f.write(consensus + "\n")
 
+        try:
+            total_copy_number = sum(copy_numbers[rec_id] for rec_id, _ in cluster)
+        except KeyError as e:
+            sys.exit(
+                f"ERROR: cluster member id {e} not found in --in-tsv ({args.in_tsv}) — "
+                f"--in-fasta and --in-tsv must be the matching 01_raw_consensus pair for this bin"
+            )
+
         gc = (consensus.count("G") + consensus.count("C")) / len(consensus) if consensus else 0.0
         summary_rows.append({
             "label": label, "rank": rank, "n_input_sequences": len(cluster),
             "pct_of_bin": f"{100.0 * len(cluster) / n_total:.2f}" if n_total else "NA",
-            "consensus_length": len(consensus), "gc_content": f"{gc:.4f}", "fasta": out_path,
+            "consensus_length": len(consensus), "gc_content": f"{gc:.4f}",
+            "total_copy_number": f"{total_copy_number:.1f}", "fasta": out_path,
         })
 
     with open(args.out_summary, "w") as out:
-        out.write("label\trank\tn_input_sequences\tpct_of_bin\tconsensus_length\tgc_content\tfasta\n")
+        out.write("label\trank\tn_input_sequences\tpct_of_bin\tconsensus_length\tgc_content\t"
+                   "total_copy_number\tfasta\n")
         for r in summary_rows:
             out.write(f"{r['label']}\t{r['rank']}\t{r['n_input_sequences']}\t{r['pct_of_bin']}\t"
-                      f"{r['consensus_length']}\t{r['gc_content']}\t{r['fasta']}\n")
+                      f"{r['consensus_length']}\t{r['gc_content']}\t{r['total_copy_number']}\t"
+                      f"{r['fasta']}\n")
 
     sys.stderr.write(
         f"[rank_family_clusters] {args.motif_name}: {len(clusters) - n_consensus_failed} clusters "
