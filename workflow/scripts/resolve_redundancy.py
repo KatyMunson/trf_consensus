@@ -303,19 +303,25 @@ def main():
     # sub-winners can only both reach here if they were never flagged
     # against each other) -- if it fires, that's a signal worth investigating
     # on its own, not evidence this fix is incomplete.
-    seen_header_keys = set()
+    seen_header_keys = {}
     for row in rows_out:
         if row["within_entry_consolidated_into"] != "NA":
             continue
         key = (row["final_name"], row["source_entry_id"])
         if key in seen_header_keys:
+            prev = seen_header_keys[key]
             sys.exit(
                 f"ERROR: family '{row['final_name']}' has more than one cluster from entry "
-                f"'{row['source_entry_id']}' — the {{final_name}}__{{entry_id}} library header "
-                f"format can't disambiguate them. Resolve manually (this is not expected to "
-                f"happen for one cluster-per-bin-per-entry input)."
+                f"'{row['source_entry_id']}':\n"
+                f"  {prev['source_cluster_label']} (consensus_length={prev['source_consensus_length']}, "
+                f"copy_number={prev['source_copy_number']})\n"
+                f"  {row['source_cluster_label']} (consensus_length={row['source_consensus_length']}, "
+                f"copy_number={row['source_copy_number']})\n"
+                f"Resolve manually."
             )
-        seen_header_keys.add(key)
+        seen_header_keys[key] = row
+
+
 
     with open(args.out_summary, "w") as out:
         out.write("\t".join(out_columns) + "\n")
