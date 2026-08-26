@@ -1,51 +1,76 @@
 # =============================================================================
-# Snakefile — TRF Motif Consensus-of-Consensus Pipeline (fully programmatic)
+# Snakefile — TRF Motif Consensus-of-Consensus Pipeline (multi-entry, fully
+# programmatic)
 #
-# Fully automatic, no manually-curated periods.tsv:
+# Manifest-driven: every run is defined by config["manifest"] (see
+# config/manifest.example.tsv), one row per "entry" = one individual
+# analyzed by one assembly method. A phased entry pools both haplotypes'
+# TRF .dat files at calling time (before any clustering); an unphased entry
+# has one .dat file. A single-assembly run is just a 1-row manifest — there
+# is no separate single-.dat mode.
 #
-#   1. scan_dat_candidates (checkpoint) — scans the whole .dat file directly
-#      and nominates every period bin meeting the candidate_scan filters.
-#      No manual pause/curation step — every passing bin proceeds.
+# Per entry (namespaced under results/{entry_id}/...), unchanged from the
+# single-assembly pipeline in its core logic:
+#
+#   1. scan_dat_candidates (checkpoint) — scans the entry's .dat file(s)
+#      directly and nominates every period bin meeting the candidate_scan
+#      filters. No manual pause/curation step — every passing bin proceeds.
 #   2. extract_by_period — per bin, pull consensus motifs (TRF .dat field 14)
-#      for entries within period +/- window.
+#      for entries within period +/- window, pooling every matching locus
+#      across all of this entry's .dat file(s).
 #   3. rank_family_clusters — per bin, iteratively peel off coherent
-#      sequence clusters (rotation/strand-aware anchor matching, same trick
-#      as before) and rank them by size: O(rounds x N) per bin, not O(N^2)
-#      all-vs-all. Produces one consensus per cluster (rank 1 = most
-#      support, rank 2, ...). Sequences that never join a cluster of
-#      min_cluster_size are dropped, not reported.
-#   4. build_all_clusters_table — aggregates every bin's ranked clusters
-#      into one master table.
-#   5. cross_cluster_comparison — pairwise rotation/strand-aware comparison
-#      across EVERY cluster found (all bins, all ranks — including within
-#      the same bin), flagging near-identical or integer-multiple pairs.
-#   6. resolve_redundancy — processes clusters in descending support order;
-#      each cluster is checked only against already-confirmed winners (never
-#      against another loser, never chained transitively through an
-#      intermediate). If flagged against a winner it's marked redundant with
-#      that winner specifically; otherwise it becomes a winner itself.
-#      Nothing is dropped — losers are kept in the summary table and the
-#      RepeatMasker library, marked redundant (both in the summary table and
-#      in the library's classification field), rather than removed.
-#   7. known-repeat screening (prepare_known_repeat_query ->
-#      run_repeatmasker_known_screen -> parse_known_repeat_hits) — runs
-#      RepeatMasker -species against OUR OWN discovered consensus motifs
-#      (not the assembly) to check whether any match a previously
-#      characterized repeat family in Dfam/RepBase. A targeted, much
-#      cheaper "is this already known" check than screening the whole
-#      assembly. Uses a fresh, pipeline-owned RepeatMasker install (conda
-#      only, see workflow/envs/repeatmasker.yaml — floor-pinned to the
-#      latest release. The FamDB library it needs does NOT come bundled or
-#      auto-downloaded on this version chain, so the first run after a
-#      fresh env build will fail with "FamDB data directory not found" —
-#      this is expected, not a bug; see the README's "Known-repeat
-#      screening" section for the one-time manual setup), independent of
-#      whatever version/library may already be on the cluster.
+#      sequence clusters (rotation/strand-aware anchor matching) and rank
+#      them by size, also summing raw TRF copy_number per cluster into
+#      total_copy_number (the per-entry support metric used downstream).
+#   4. build_all_clusters_table + combine_cluster_fastas — aggregate every
+#      bin's ranked clusters into one per-entry master table/FASTA.
 #
-# This requires Snakemake checkpoints (checkpoint scan_dat_candidates):
-# the bin list isn't known until the scan actually runs, so downstream rules
-# use input functions that call checkpoints.scan_dat_candidates.get(...) to
-# discover it at DAG-re-evaluation time, rather than a static manifest.
+# Across entries:
+#
+#   2b. plot_copy_number_diagnostic — once every entry's Stage 2 has run,
+#       pools every entry's PRE-FILTER total_copy_number values into one
+#       log-scaled histogram with the configured min_total_copy_number
+#       threshold marked, so it can be sanity-checked before committing to
+#       a rerun.
+#   3.  filter_and_pool_clusters — drops each entry's clusters below
+#       min_total_copy_number, then pools every survivor across every entry
+#       into one table (cluster_uid = {entry_id}__{source_cluster_label})
+#       and one concatenated FASTA.
+#   4.  cross_cluster_comparison — pairwise rotation/strand-aware comparison
+#       across every pooled cluster (all entries, all bins, all ranks),
+#       flagging near-identical or integer-multiple pairs. Unchanged logic —
+#       operates purely on sequence content.
+#   5.  resolve_redundancy — processes pooled clusters in descending
+#       total_copy_number order; each cluster is checked only against
+#       already-confirmed winners (never against another loser, never
+#       chained transitively through an intermediate). Winners become named
+#       families (SAT{motif_length}_{letter}); other members are marked
+#       redundant with their family, not dropped. Every row is annotated
+#       with which entries/individuals/methods it was found in.
+#   6.  plot_top_families — per-individual and global bar charts ranking
+#       families by copy number (max across an individual's own entries,
+#       per spec — not summed, to avoid conflating two methods'
+#       measurements of the same underlying quantity).
+#   7.  known-repeat screening (prepare_known_repeat_query ->
+#       run_repeatmasker_known_screen -> parse_known_repeat_hits) — runs
+#       RepeatMasker -species against OUR OWN discovered consensus motifs
+#       (not the assembly) to check whether any match a previously
+#       characterized repeat family in Dfam/RepBase. Unchanged — already
+#       treats FASTA headers generically. Uses a fresh, pipeline-owned
+#       RepeatMasker install (conda only, see workflow/envs/repeatmasker.yaml
+#       — floor-pinned to the latest release. The FamDB library it needs
+#       does NOT come bundled or auto-downloaded on this version chain, so
+#       the first run after a fresh env build will fail with "FamDB data
+#       directory not found" — this is expected, not a bug; see the
+#       README's "Known-repeat screening" section for the one-time manual
+#       setup), independent of whatever version/library may already be on
+#       the cluster.
+#
+# This requires Snakemake checkpoints (checkpoint scan_dat_candidates): each
+# entry's bin list isn't known until its own scan actually runs, so
+# downstream rules use input functions that call
+# checkpoints.scan_dat_candidates.get(entry_id=...) to discover it at
+# DAG-re-evaluation time, rather than a static manifest.
 #
 # Usage: snakemake -s Snakefile --configfile config/config.yaml --cores <N> \
 #          --use-envmodules --retries 3
@@ -58,14 +83,70 @@
 import os
 
 wildcard_constraints:
+    entry_id="[^/]+",
     motif="[^/]+",
 
 
-def get_manifest(wildcards):
-    """Parse the scan checkpoint's manifest into {name: (period, window)}.
-    Every rule/function that needs the bin list or a bin's period/window
-    calls this, which forces the checkpoint to complete first."""
-    path = checkpoints.scan_dat_candidates.get(**wildcards).output.manifest
+# --- manifest parsing (static, at load time -- NOT a checkpoint) ---
+# First non-blank line is a mandatory header row (entry_id, individual,
+# assembly_method, phasing_status, fasta_paths, trf_dat_paths) and is
+# skipped, matching config/manifest.example.tsv's format.
+MANIFEST = {}
+with open(config["manifest"]) as f:
+    header_skipped = False
+    for lineno, line in enumerate(f, 1):
+        if not line.strip():
+            continue
+        if not header_skipped:
+            header_skipped = True
+            continue
+
+        fields = line.rstrip("\n").split("\t")
+        if len(fields) != 6:
+            raise ValueError(
+                f"manifest line {lineno}: expected 6 tab-separated fields "
+                f"(entry_id, individual, assembly_method, phasing_status, "
+                f"fasta_paths, trf_dat_paths), got {len(fields)}"
+            )
+        entry_id, individual, assembly_method, phasing_status, fasta_paths, trf_dat_paths = fields
+        if entry_id in MANIFEST:
+            raise ValueError(f"manifest line {lineno}: duplicate entry_id '{entry_id}'")
+        if phasing_status not in ("phased_pooled", "unphased"):
+            raise ValueError(
+                f"manifest line {lineno}: phasing_status must be 'phased_pooled' or "
+                f"'unphased', got '{phasing_status}'"
+            )
+        n_fasta = len(fasta_paths.split(";"))
+        n_dat = len(trf_dat_paths.split(";"))
+        expected_n = 2 if phasing_status == "phased_pooled" else 1
+        if n_fasta != expected_n or n_dat != expected_n:
+            raise ValueError(
+                f"manifest line {lineno}: phasing_status '{phasing_status}' requires "
+                f"exactly {expected_n} ;-separated path(s) in both fasta_paths and "
+                f"trf_dat_paths, got {n_fasta} fasta path(s) and {n_dat} trf_dat path(s)"
+            )
+        MANIFEST[entry_id] = {
+            "individual": individual, "assembly_method": assembly_method,
+            "phasing_status": phasing_status, "fasta_paths": fasta_paths,
+            "trf_dat_paths": trf_dat_paths,
+        }
+
+if not MANIFEST:
+    raise ValueError(f"No entries found in manifest {config['manifest']}!")
+
+ENTRY_IDS = list(MANIFEST)
+INDIVIDUALS = sorted({v["individual"] for v in MANIFEST.values()})
+
+
+def entry_dat_paths(wildcards):
+    return MANIFEST[wildcards.entry_id]["trf_dat_paths"].split(";")
+
+
+def get_period_manifest(wildcards):
+    """Parse one entry's scan checkpoint manifest into {name: (period, window)}.
+    Every rule/function that needs that entry's bin list or a bin's
+    period/window calls this, which forces the checkpoint to complete first."""
+    path = checkpoints.scan_dat_candidates.get(entry_id=wildcards.entry_id).output.manifest
     entries = {}
     with open(path) as f:
         for line in f:
@@ -76,24 +157,24 @@ def get_manifest(wildcards):
 
 
 def all_motifs(wildcards):
-    return list(get_manifest(wildcards).keys())
+    return list(get_period_manifest(wildcards).keys())
 
 
 def motif_period(wildcards):
-    return get_manifest(wildcards)[wildcards.motif][0]
+    return get_period_manifest(wildcards)[wildcards.motif][0]
 
 
 def motif_window(wildcards):
-    return get_manifest(wildcards)[wildcards.motif][1]
+    return get_period_manifest(wildcards)[wildcards.motif][1]
 
 
 def all_motif_periods(wildcards):
-    m = get_manifest(wildcards)
+    m = get_period_manifest(wildcards)
     return [m[name][0] for name in m]
 
 
 def all_motif_windows(wildcards):
-    m = get_manifest(wildcards)
+    m = get_period_manifest(wildcards)
     return [m[name][1] for name in m]
 
 
@@ -101,20 +182,27 @@ rule all:
     input:
         "results/repeatmasker_custom_lib.fasta",
         "results/summary_table.tsv",
-        "results/known_repeat_hits.tsv"
+        "results/known_repeat_hits.tsv",
+        "results/copy_number_diagnostic.png",
+        "results/copy_number_qc_scatter.png",
+        "results/copy_number_vs_recurrence.png",
+        "results/top_families_global.png",
+        expand("results/top_families_{individual}.png", individual=INDIVIDUALS)
 
 
 checkpoint scan_dat_candidates:
-    # Scans the whole .dat file directly; the bin list downstream rules use
-    # is determined here, at runtime, not known when the DAG is built.
+    # Scans this entry's whole .dat file(s) directly (pooled together if
+    # there are two, one per haplotype); the bin list downstream rules use
+    # for this entry is determined here, at runtime, not known when the
+    # DAG is built.
     input:
-        dat=config["trf_dat"]
+        dat=entry_dat_paths
     output:
-        tsv="results/candidate_periods.tsv",
-        raw_tsv="results/candidate_periods_raw.tsv",
-        manifest="results/candidate_periods_manifest.tsv"
+        tsv="results/{entry_id}/candidate_periods.tsv",
+        raw_tsv="results/{entry_id}/candidate_periods_raw.tsv",
+        manifest="results/{entry_id}/candidate_periods_manifest.tsv"
     log:
-        "results/logs/scan_dat_candidates.log"
+        "results/logs/{entry_id}/scan_dat_candidates.log"
     threads: config["resources"]["scan_dat_candidates"]["threads"]
     resources:
         mem=lambda wildcards, attempt: config["resources"]["scan_dat_candidates"]["mem"] * attempt,
@@ -138,16 +226,16 @@ checkpoint scan_dat_candidates:
 
 rule extract_by_period:
     input:
-        dat=config["trf_dat"],
-        manifest=lambda wc: checkpoints.scan_dat_candidates.get(**wc).output.manifest
+        dat=entry_dat_paths,
+        manifest=lambda wc: checkpoints.scan_dat_candidates.get(entry_id=wc.entry_id).output.manifest
     output:
-        fasta="results/{motif}/01_raw_consensus.fasta",
-        tsv="results/{motif}/01_raw_consensus.tsv"
+        fasta="results/{entry_id}/{motif}/01_raw_consensus.fasta",
+        tsv="results/{entry_id}/{motif}/01_raw_consensus.tsv"
     params:
         period=motif_period,
         window=motif_window
     log:
-        "results/logs/{motif}/extract_by_period.log"
+        "results/logs/{entry_id}/{motif}/extract_by_period.log"
     threads: config["resources"]["extract_by_period"]["threads"]
     resources:
         mem=lambda wildcards, attempt: config["resources"]["extract_by_period"]["mem"] * attempt,
@@ -169,14 +257,15 @@ rule rank_family_clusters:
     # mafft and does majority-consensus calling internally, since the
     # cluster count per bin isn't known ahead of time.
     input:
-        fasta="results/{motif}/01_raw_consensus.fasta"
+        fasta="results/{entry_id}/{motif}/01_raw_consensus.fasta",
+        tsv="results/{entry_id}/{motif}/01_raw_consensus.tsv"
     output:
-        clusters_dir=directory("results/{motif}/ranked_clusters"),
-        summary="results/{motif}/ranked_clusters_summary.tsv"
+        clusters_dir=directory("results/{entry_id}/{motif}/ranked_clusters"),
+        summary="results/{entry_id}/{motif}/ranked_clusters_summary.tsv"
     params:
         motif_name=lambda wc: wc.motif
     log:
-        "results/logs/{motif}/rank_family_clusters.log"
+        "results/logs/{entry_id}/{motif}/rank_family_clusters.log"
     threads: config["resources"]["rank_family_clusters"]["threads"]
     resources:
         mem=lambda wildcards, attempt: config["resources"]["rank_family_clusters"]["mem"] * attempt,
@@ -187,7 +276,7 @@ rule rank_family_clusters:
         "python/3.11", "mafft/7.487"  # verify with `module avail mafft` on liger and adjust
     shell:
         "python workflow/scripts/rank_family_clusters.py "
-        "--in-fasta {input.fasta} --out-dir {output.clusters_dir} "
+        "--in-fasta {input.fasta} --in-tsv {input.tsv} --out-dir {output.clusters_dir} "
         "--out-summary {output.summary} --motif-name {params.motif_name} "
         "--min-identity {config[cluster_ranking][min_cluster_identity]} "
         "--max-gap-fraction {config[cluster_ranking][max_gap_fraction]} "
@@ -197,16 +286,18 @@ rule rank_family_clusters:
 
 rule build_all_clusters_table:
     input:
-        summaries=lambda wc: expand("results/{motif}/ranked_clusters_summary.tsv", motif=all_motifs(wc)),
-        dirs=lambda wc: expand("results/{motif}/ranked_clusters", motif=all_motifs(wc))
+        summaries=lambda wc: expand("results/{entry_id}/{motif}/ranked_clusters_summary.tsv",
+                                     entry_id=wc.entry_id, motif=all_motifs(wc)),
+        dirs=lambda wc: expand("results/{entry_id}/{motif}/ranked_clusters",
+                                entry_id=wc.entry_id, motif=all_motifs(wc))
     output:
-        "results/all_clusters.tsv"
+        "results/{entry_id}/all_clusters.tsv"
     params:
         motifs=lambda wc: all_motifs(wc),
         periods=lambda wc: all_motif_periods(wc),
         windows=lambda wc: all_motif_windows(wc)
     log:
-        "results/logs/build_all_clusters_table.log"
+        "results/logs/{entry_id}/build_all_clusters_table.log"
     threads: config["resources"]["build_all_clusters_table"]["threads"]
     resources:
         mem=lambda wildcards, attempt: config["resources"]["build_all_clusters_table"]["mem"] * attempt,
@@ -223,16 +314,18 @@ rule build_all_clusters_table:
 
 rule combine_cluster_fastas:
     # Plain concatenation of every cluster's single-record consensus FASTA
-    # across every bin — safe at runtime since Snakemake guarantees the
-    # `directory()` outputs from rank_family_clusters are fully materialized
-    # before this rule executes (both are declared inputs).
+    # across every bin of this entry — safe at runtime since Snakemake
+    # guarantees the `directory()` outputs from rank_family_clusters are
+    # fully materialized before this rule executes (both are declared inputs).
     input:
-        summaries=lambda wc: expand("results/{motif}/ranked_clusters_summary.tsv", motif=all_motifs(wc)),
-        dirs=lambda wc: expand("results/{motif}/ranked_clusters", motif=all_motifs(wc))
+        summaries=lambda wc: expand("results/{entry_id}/{motif}/ranked_clusters_summary.tsv",
+                                     entry_id=wc.entry_id, motif=all_motifs(wc)),
+        dirs=lambda wc: expand("results/{entry_id}/{motif}/ranked_clusters",
+                                entry_id=wc.entry_id, motif=all_motifs(wc))
     output:
-        "results/all_clusters_consensus.fasta"
+        "results/{entry_id}/all_clusters_consensus.fasta"
     log:
-        "results/logs/combine_cluster_fastas.log"
+        "results/logs/{entry_id}/combine_cluster_fastas.log"
     threads: config["resources"]["combine_cluster_fastas"]["threads"]
     resources:
         mem=lambda wildcards, attempt: config["resources"]["combine_cluster_fastas"]["mem"] * attempt,
@@ -247,9 +340,89 @@ rule combine_cluster_fastas:
         "done > {output} 2> {log}"
 
 
+rule plot_copy_number_diagnostic:
+    # Runs once every entry's Stage 2 is complete, pooling every entry's
+    # PRE-FILTER total_copy_number values so the min_total_copy_number
+    # threshold used in filter_and_pool_clusters can be sanity-checked
+    # before committing to a rerun.
+    input:
+        clusters_tsv=expand("results/{entry_id}/all_clusters.tsv", entry_id=ENTRY_IDS)
+    output:
+        "results/copy_number_diagnostic.png"
+    log:
+        "results/logs/plot_copy_number_diagnostic.log"
+    threads: config["resources"]["plot_copy_number_diagnostic"]["threads"]
+    resources:
+        mem=lambda wildcards, attempt: config["resources"]["plot_copy_number_diagnostic"]["mem"] * attempt,
+        hrs=config["resources"]["plot_copy_number_diagnostic"]["hrs"]
+    conda:
+        "workflow/envs/plotting.yaml"
+    shell:
+        "python workflow/scripts/plot_copy_number_diagnostic.py "
+        "--clusters-tsv {input.clusters_tsv} "
+        "--min-total-copy-number {config[copy_number_filter][min_total_copy_number]} "
+        "--out-png {output} > {log} 2>&1"
+
+
+rule plot_copy_number_qc_diagnostic:
+    # Same input timing as plot_copy_number_diagnostic (every entry's
+    # pre-filter all_clusters.tsv) but cross-references total_copy_number
+    # against target_period and TRF's own per-locus quality fields
+    # (mean_percent_match, mean_entropy), since the plain histogram alone
+    # can't resolve an ambiguous noise/signal middle on its own.
+    input:
+        clusters_tsv=expand("results/{entry_id}/all_clusters.tsv", entry_id=ENTRY_IDS)
+    output:
+        "results/copy_number_qc_scatter.png"
+    log:
+        "results/logs/plot_copy_number_qc_diagnostic.log"
+    threads: config["resources"]["plot_copy_number_qc_diagnostic"]["threads"]
+    resources:
+        mem=lambda wildcards, attempt: config["resources"]["plot_copy_number_qc_diagnostic"]["mem"] * attempt,
+        hrs=config["resources"]["plot_copy_number_qc_diagnostic"]["hrs"]
+    conda:
+        "workflow/envs/plotting.yaml"
+    shell:
+        "python workflow/scripts/plot_copy_number_qc_diagnostic.py "
+        "--clusters-tsv {input.clusters_tsv} "
+        "--min-total-copy-number {config[copy_number_filter][min_total_copy_number]} "
+        "--out-png {output} > {log} 2>&1"
+
+
+rule filter_and_pool_clusters:
+    input:
+        clusters_tsv=expand("results/{entry_id}/all_clusters.tsv", entry_id=ENTRY_IDS),
+        fastas=expand("results/{entry_id}/all_clusters_consensus.fasta", entry_id=ENTRY_IDS)
+    output:
+        tsv="results/filtered_pooled_clusters.tsv",
+        fasta="results/pooled_consensus.fasta"
+    params:
+        entry_ids=ENTRY_IDS,
+        individuals=[MANIFEST[e]["individual"] for e in ENTRY_IDS],
+        assembly_methods=[MANIFEST[e]["assembly_method"] for e in ENTRY_IDS],
+        phasing_statuses=[MANIFEST[e]["phasing_status"] for e in ENTRY_IDS]
+    log:
+        "results/logs/filter_and_pool_clusters.log"
+    threads: config["resources"]["filter_and_pool_clusters"]["threads"]
+    resources:
+        mem=lambda wildcards, attempt: config["resources"]["filter_and_pool_clusters"]["mem"] * attempt,
+        hrs=config["resources"]["filter_and_pool_clusters"]["hrs"]
+    conda:
+        "workflow/envs/python_base.yaml"
+    envmodules:
+        "python/3.11"
+    shell:
+        "python workflow/scripts/filter_and_pool_clusters.py "
+        "--clusters-tsv {input.clusters_tsv} --fastas {input.fastas} "
+        "--entry-ids {params.entry_ids} --individuals {params.individuals} "
+        "--assembly-methods {params.assembly_methods} --phasing-statuses {params.phasing_statuses} "
+        "--min-total-copy-number {config[copy_number_filter][min_total_copy_number]} "
+        "--out-tsv {output.tsv} --out-fasta {output.fasta} > {log} 2>&1"
+
+
 rule cross_cluster_comparison:
     input:
-        fasta="results/all_clusters_consensus.fasta"
+        fasta="results/pooled_consensus.fasta"
     output:
         "results/cross_cluster_comparison.tsv"
     log:
@@ -275,9 +448,9 @@ rule cross_cluster_comparison:
 
 rule resolve_redundancy:
     input:
-        clusters_tsv="results/all_clusters.tsv",
+        clusters_tsv="results/filtered_pooled_clusters.tsv",
         comparison_tsv="results/cross_cluster_comparison.tsv",
-        consensus_fasta="results/all_clusters_consensus.fasta"
+        consensus_fasta="results/pooled_consensus.fasta"
     output:
         lib_fasta="results/repeatmasker_custom_lib.fasta",
         summary="results/summary_table.tsv"
@@ -299,10 +472,60 @@ rule resolve_redundancy:
         "--out-lib-fasta {output.lib_fasta} --out-summary {output.summary} > {log} 2>&1"
 
 
+rule plot_top_families:
+    input:
+        summary="results/summary_table.tsv"
+    output:
+        global_png="results/top_families_global.png",
+        per_individual=expand("results/top_families_{individual}.png", individual=INDIVIDUALS)
+    params:
+        individuals=INDIVIDUALS,
+        top_n=config["visualization"]["top_n_families"]
+    log:
+        "results/logs/plot_top_families.log"
+    threads: config["resources"]["plot_top_families"]["threads"]
+    resources:
+        mem=lambda wildcards, attempt: config["resources"]["plot_top_families"]["mem"] * attempt,
+        hrs=config["resources"]["plot_top_families"]["hrs"]
+    conda:
+        "workflow/envs/plotting.yaml"
+    shell:
+        "python workflow/scripts/plot_top_families.py "
+        "--summary-tsv {input.summary} --individuals {params.individuals} "
+        "--out-per-individual {output.per_individual} --out-global {output.global_png} "
+        "--top-n {params.top_n} > {log} 2>&1"
+
+
+rule plot_copy_number_vs_recurrence:
+    # Post-harmonization diagnostic: one point per family (representative's
+    # own total_copy_number) vs. how many entries/methods independently
+    # confirmed it — recurrence a single-entry copy-number threshold can't
+    # see at all. Purely descriptive; no filtering/ranking logic here.
+    input:
+        summary="results/summary_table.tsv"
+    output:
+        "results/copy_number_vs_recurrence.png"
+    log:
+        "results/logs/plot_copy_number_vs_recurrence.log"
+    threads: config["resources"]["plot_copy_number_vs_recurrence"]["threads"]
+    resources:
+        mem=lambda wildcards, attempt: config["resources"]["plot_copy_number_vs_recurrence"]["mem"] * attempt,
+        hrs=config["resources"]["plot_copy_number_vs_recurrence"]["hrs"]
+    conda:
+        "workflow/envs/plotting.yaml"
+    shell:
+        "python workflow/scripts/plot_copy_number_vs_recurrence.py "
+        "--summary-tsv {input.summary} --out-png {output} > {log} 2>&1"
+
+
 # --- Step 7: known-repeat screening ---
 # Screens our own discovered consensus motifs (not the assembly) against a
 # Dfam/RepBase library via RepeatMasker -species, to check whether any
-# match a previously characterized repeat family.
+# match a previously characterized repeat family. Unchanged from the
+# single-assembly pipeline: both scripts treat FASTA headers generically
+# (split on the first "#"), with no assumption about label format, so the
+# new {final_name}__{entry_id}#{classification} headers need zero changes
+# here.
 
 rule prepare_known_repeat_query:
     # Strips our own #classification suffix down to the bare label (our
@@ -332,7 +555,7 @@ rule prepare_known_repeat_query:
 
 
 rule run_repeatmasker_known_screen:
-    # Deliberately conda-only, no envmodules: fallback — unlike every other
+    # Deliberately conda-only, no envmodules fallback — unlike every other
     # rule in this pipeline. The point of this rule is a fresh,
     # pipeline-owned RepeatMasker install, its own bundled library, not
     # reuse of whatever version/library happens to already be on the

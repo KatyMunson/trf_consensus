@@ -1,44 +1,67 @@
 # TRF Motif Consensus-of-Consensus Pipeline
 
-Fully automatic, no manually-curated candidate list: scans a raw TRF `.dat`
-file for candidate period bins, builds a ranked set of consensus sequences
-per bin via iterative clustering, resolves redundancy across every cluster
-found (including tandem-duplicate relationships between different bins),
-and outputs a single RepeatMasker-ready custom library plus a QC summary
-table.
+Fully automatic, no manually-curated candidate list: given a **manifest**
+of one or more entries (one individual analyzed by one assembly method
+each), it scans each entry's raw TRF `.dat` file(s) for candidate period
+bins, builds a ranked set of consensus sequences per bin via iterative
+clustering, pools every entry's surviving clusters and resolves redundancy
+across them (including tandem-duplicate relationships and cross-entry
+matches), and outputs a single RepeatMasker-ready custom library plus a QC
+summary table annotated with which individuals/methods found each family.
+A single-assembly run is just a 1-row manifest — there's no separate
+single-`.dat` mode.
 
 ## Pipeline
 
 ```
+config/manifest.tsv
+        |
+        v  (once per entry, namespaced under results/{entry_id}/...)
 scan_dat_candidates (checkpoint)
         |
         v
-extract_by_period  (per bin)
+extract_by_period  (per bin — pools both haplotypes' .dat files for a phased entry)
         |
         v
-rank_family_clusters  (per bin: iterative clustering + per-cluster consensus)
+rank_family_clusters  (per bin: iterative clustering + per-cluster consensus + total_copy_number)
         |
         v
 build_all_clusters_table  +  combine_cluster_fastas
+        |
+        v  (once every entry has finished the above)
+plot_copy_number_diagnostic  (results/copy_number_diagnostic.png)
+plot_copy_number_qc_diagnostic  (results/copy_number_qc_scatter.png)
+        |
+        v
+filter_and_pool_clusters  (drop below min_total_copy_number, pool across entries)
         |
         v
 cross_cluster_comparison
         |
         v
-resolve_redundancy
+resolve_redundancy  (names families, annotates provenance)
         |
         v
 results/repeatmasker_custom_lib.fasta + results/summary_table.tsv
+        |
+        v
+plot_top_families  (per-individual + global ranking plots)
+plot_copy_number_vs_recurrence  (results/copy_number_vs_recurrence.png)
 ```
 
-1. **`scan_dat_candidates`** scans the whole `.dat` file directly and
+1. **`scan_dat_candidates`** scans one entry's whole `.dat` file(s) directly
+   (both haplotypes pooled together for a `phased_pooled` entry) and
    nominates every period bin meeting the `candidate_scan` filters (see
-   below). This is a Snakemake **checkpoint** — the bin list isn't known
-   until this actually runs, so everything downstream is generated
-   dynamically from its output, not from a static manifest file. There's no
-   manual pause or curation step: every passing bin proceeds automatically.
-2. **`extract_by_period`** pulls each bin's loci out of the `.dat` file
-   (unchanged from earlier versions of this pipeline).
+   below). This is a Snakemake **checkpoint**, run once per manifest entry —
+   that entry's bin list isn't known until this actually runs, so everything
+   downstream for that entry is generated dynamically from its output. There's
+   no manual pause or curation step: every passing bin proceeds automatically.
+2. **`extract_by_period`** pulls each bin's loci out of the entry's `.dat`
+   file(s). For a `phased_pooled` entry this is the haplotype-pooling step:
+   every matching locus from both haplotype files is written into one
+   combined `01_raw_consensus.fasta`/`.tsv`, so a phased and an unphased
+   entry both end up representing the same amount of underlying diploid
+   genome (no ~2x copy-number gap between them purely from file count).
 3. **`rank_family_clusters`** replaces the old two-round primary/secondary
    system entirely. For each bin, it repeatedly: picks a reference sequence
    (median length among whatever remains), anchor-matches everyone else
@@ -47,10 +70,16 @@ results/repeatmasker_custom_lib.fasta + results/summary_table.tsv
    remaining pool is smaller than `min_cluster_size` or `max_rounds` is
    hit. All discovered clusters in a bin are then sorted by size: rank 1 =
    most support, rank 2 = next, etc. Each cluster gets its own MAFFT
-   alignment and majority-rule consensus. **Sequences that never join a
-   cluster of the minimum size are dropped, not reported** — this pipeline
-   is tuned for finding high-signal candidates (centromeric/large satellite
-   arrays), not for characterizing background noise.
+   alignment and majority-rule consensus, plus a summed `total_copy_number`
+   (raw TRF `copy_number`, not locus count) across every locus that joined
+   it — the per-entry support metric everything downstream ranks and filters
+   on — and copy-number-weighted `mean_percent_match` / `mean_entropy`
+   (TRF's own per-locus quality fields) across those same loci, feeding
+   step 6's QC cross-reference diagnostic. **Sequences that never join a
+   cluster of the minimum size are
+   dropped, not reported** — this pipeline is tuned for finding high-signal
+   candidates (centromeric/large satellite arrays), not for characterizing
+   background noise.
 
    This is deliberately **not** full all-vs-all pairwise clustering.
    All-vs-all is O(N²) alignments — a bin with a few thousand loci is
@@ -62,9 +91,40 @@ results/repeatmasker_custom_lib.fasta + results/summary_table.tsv
    primary until every cluster in every bin has been found and sizes
    compared globally, in the redundancy-resolution step below.
 4. **`build_all_clusters_table`** + **`combine_cluster_fastas`** aggregate
-   every bin's ranked clusters into one master table and one combined FASTA.
-5. **`cross_cluster_comparison`** compares every cluster found — all bins,
-   all ranks, including different ranks within the same bin — using
+   every bin's ranked clusters into one master table and one combined FASTA
+   — per entry.
+5. **`plot_copy_number_diagnostic`** runs once every entry has finished the
+   above, pooling every entry's *pre-filter* `total_copy_number` values
+   (including clusters about to be dropped — that's the point) into one
+   log-x-scaled histogram with a vertical line at the configured
+   `min_total_copy_number`, so you can eyeball whether the threshold
+   actually sits in a gap between background noise and real signal before
+   committing to a rerun.
+6. **`plot_copy_number_qc_diagnostic`** runs alongside step 5 (same
+   pre-filter input timing), because the plain histogram alone can't
+   always resolve an ambiguous noise/signal boundary — a real run might
+   show a noisy plateau with no clean valley rather than the two-population
+   split the histogram assumes. Cross-references the same
+   `total_copy_number` against `target_period` and two of TRF's own
+   per-locus quality fields aggregated per cluster
+   (`mean_percent_match`, `mean_entropy`, both **copy-number-weighted**
+   across the cluster's raw loci — a locus that itself represents a large
+   array counts proportionally more toward the cluster's average quality
+   than a low-copy-number one), colored by whether each cluster currently
+   passes the threshold. Look for red (filtered) points sitting high on
+   percent-match/entropy — candidates possibly excluded for a reason other
+   than being noise (e.g. an array fragmented across assembly gaps) — and
+   blue (passing) points sitting low on those axes, which look questionable
+   on every other available signal.
+7. **`filter_and_pool_clusters`** drops each entry's clusters below
+   `min_total_copy_number`, then pools every surviving cluster from every
+   entry into one table and one FASTA. Clusters are renamed
+   `cluster_uid = {entry_id}__{source_cluster_label}` so labels that
+   collide across entries (e.g. two entries both producing a
+   `cand171_rank1_n...` label) stay distinct once pooled.
+8. **`cross_cluster_comparison`** compares every pooled cluster found — all
+   entries, all bins, all ranks, including different ranks within the same
+   bin — using
    **coverage-aware tiling with a randomization significance test**, not a
    single lump alignment. For each pair (shorter sequence A, longer
    sequence B), it greedily tiles B with non-overlapping copies of A
@@ -86,23 +146,49 @@ results/repeatmasker_custom_lib.fasta + results/summary_table.tsv
    otherwise inflate the false-positive rate beyond what the raw identity
    threshold implies, especially for short or compositionally simple
    sequences.
-6. **`resolve_redundancy`** processes clusters in descending support order
-   (highest `n_input_sequences` first). Each cluster is checked only
-   against clusters **already confirmed as winners** — never against
-   another loser, never chained through an intermediate. If it's flagged
-   against an existing winner, it's marked redundant with that winner
-   specifically (a direct, individually-verified relationship); otherwise
-   it becomes a new winner itself. **This deliberately avoids transitive
+9. **`resolve_redundancy`** processes pooled clusters in descending
+   `total_copy_number` order (not `n_input_sequences` — copy number is the
+   fair cross-entry/cross-method support metric now that pooling is
+   involved). Each cluster is checked only against clusters **already
+   confirmed as winners** — never against another loser, never chained
+   through an intermediate. If it's flagged against an existing winner, it
+   joins that winner's family; otherwise it becomes a new winner and the
+   representative of a new family. **This deliberately avoids transitive
    union-find** (A~B flagged + B~C flagged does NOT imply A~C) — plain
    union-find over flagged pairs was tried first and, on real data,
    collapsed dozens of genuinely unrelated candidates spanning an 11x
    period range into one meaningless "family" simply because each
    consecutive pair along a chain happened to be individually flagged.
-   Nothing is dropped — losers are kept in both the summary table and the
-   final RepeatMasker library, marked `is_redundant=True` / demoted to
-   `#Satellite/redundant_with_<winner>` in the library's classification
-   field, so they're still visible (and RepeatMasker-usable) but clearly
-   lower priority.
+   Every winner is named `SAT{motif_length}_{letter}`, where `motif_length`
+   is that winner's own exact `consensus_length` (no rounding/averaging —
+   different entries' independent MSAs can legitimately disagree by a base
+   or two) and `letter` disambiguates families that happen to share a
+   motif_length, assigned in discovery order. Every row is annotated with
+   which entries/individuals/methods its family was found in. Nothing is
+   dropped — non-representative members are kept in both the summary table
+   (`is_representative=False`) and the final RepeatMasker library, demoted
+   to `#Satellite/redundant_with_<final_name>` in the library's
+   classification field, so they're still visible (and RepeatMasker-usable)
+   but clearly lower priority.
+10. **`plot_top_families`** reads the final summary table and produces one
+    ranking bar chart per individual (that individual's own families, by the
+    *max* `source_copy_number` across that individual's own entries — not a
+    sum, to avoid conflating two methods' independent measurements of the
+    same underlying quantity) plus one global chart across all
+    individuals/entries. Bars are colored by whether the family was found in
+    more than one individual, as a visual cross-check against
+    `n_individuals_present`.
+11. **`plot_copy_number_vs_recurrence`** runs after step 9, one point per
+    family (the representative's own `total_copy_number`) against how many
+    entries and how many methods independently confirmed it
+    (`n_entries_found` / `n_methods_confirming`, as two side-by-side panels
+    since they can tell different stories — e.g. a family found in several
+    entries but only one method is a weaker claim than one confirmed by two
+    different methods). Cross-entry recurrence is confirmation a
+    single-entry copy-number threshold can't see at all; this view is what
+    makes a *more permissive* `min_total_copy_number` combined with a good
+    recurrence signal a defensible choice, rather than asking one static
+    threshold to do all the noise/signal separation alone.
 
 ## Sanity-checking a mega-group
 
@@ -120,11 +206,38 @@ its own candidate, not demoted). `null_passes` tells you how many of the
 20 randomization trials also passed by chance — anything above 0 is worth
 a second look.
 
+## Manifest
+
+`config/manifest.tsv` (see the worked example at
+`config/manifest.example.tsv`) is a tab-separated file, one row per
+**entry** = one individual analyzed by one assembly method:
+
+| column | meaning |
+|---|---|
+| `entry_id` | `{individual}_{assembly_method}` — the unit of analysis from here on, and the namespace prefix for that entry's `results/{entry_id}/...` outputs |
+| `individual` | which biological individual |
+| `assembly_method` | which assembly pipeline produced the input(s) |
+| `phasing_status` | `phased_pooled` (two haplotype-specific `.dat` files, pooled at calling time) or `unphased` (one diploid `.dat` file) |
+| `fasta_paths` | one path, or two `;`-separated paths (`hap1;hap2`) — **provenance/documentation only**, no script actually reads these |
+| `trf_dat_paths` | one path, or two `;`-separated paths, positionally paired with `fasta_paths` — this is what the pipeline actually consumes |
+
+A `phased_pooled` entry must give exactly 2 paths in both `fasta_paths` and
+`trf_dat_paths`; an `unphased` entry must give exactly 1 — the Snakefile
+validates this at load time and fails fast with a clear error otherwise.
+Pooled `.dat` files for one entry should use distinct/prefixed contig names
+across the two haplotypes if possible; if they don't,
+`extract_by_period.py` defensively prefixes locus ids with a haplotype-file
+index (`h0:`, `h1:`) to avoid silent id collisions in per-locus lookups
+downstream.
+
+A single-assembly run is just a 1-row manifest.
+
 ## Setup
 
 Edit `config/config.yaml`:
-- `trf_dat`: path to your `.dat` file
-- `trf_dat_default_seqname`: only needed if your `.dat` has no header lines at all
+- `manifest`: path to your manifest (see "Manifest" above)
+- `trf_dat_default_seqname`: only needed if a `.dat` has no header lines at
+  all — one global fallback applied to every entry, not configurable per entry
 - `repeatmasker_classification`: default `"Satellite"` — edit to match how you
   want these classified before loading into RepeatMasker/FamDB
 - **Verify the MAFFT module name** — `rank_family_clusters` requests
@@ -140,21 +253,25 @@ snakemake -s Snakefile --configfile config/config.yaml \
     --cores 48 --use-envmodules --use-conda --retries 3
 ```
 
-**Both `--use-envmodules` and `--use-conda` are required together** — every
-rule but one uses envmodules (matching the rest of this pipeline's
-cluster-module setup), but `run_repeatmasker_known_screen` deliberately has
-no `envmodules:` fallback (it installs its own fresh, pipeline-owned
+**Both `--use-envmodules` and `--use-conda` are required together** — most
+rules use envmodules (matching the rest of this pipeline's cluster-module
+setup), but a few deliberately have no `envmodules:` fallback:
+`run_repeatmasker_known_screen` (it installs its own fresh, pipeline-owned
 RepeatMasker via conda rather than reusing whatever's already on the
-cluster — see "Known-repeat screening" below). Passing both flags lets
-Snakemake use envmodules wherever a rule defines them and fall back to
-conda for that one rule; passing `--use-envmodules` alone would run
-RepeatMasker with no environment management at all.
+cluster — see "Known-repeat screening" below), and
+`plot_copy_number_diagnostic`/`plot_copy_number_qc_diagnostic`/
+`plot_top_families`/`plot_copy_number_vs_recurrence` (matplotlib isn't
+assumed to have a cluster module, so they're conda-only). Passing both
+flags lets Snakemake use envmodules wherever a rule defines them and fall
+back to conda for the rest; passing `--use-envmodules` alone would run
+those rules with no environment management at all.
 
 (Swap `--use-envmodules` for `--use-conda` to run off the per-rule envs in
 `workflow/envs/` instead: `python_base.yaml` for pure-Python rules,
-`edlib.yaml` for `cross_cluster_comparison`, `cluster_rank.yaml`
-[edlib + mafft together] for `rank_family_clusters`, the only rule that
-needs both tools in one process.)
+`edlib.yaml` for `cross_cluster_comparison`, `cluster_rank.yaml` [edlib + mafft together] for `rank_family_clusters`,
+`plotting.yaml` [matplotlib] for the four plotting rules
+(`plot_copy_number_diagnostic`, `plot_copy_number_qc_diagnostic`,
+`plot_top_families`, `plot_copy_number_vs_recurrence`).)
 
 Because `scan_dat_candidates` is a checkpoint, the first `snakemake -n`
 dry-run will report "the run involves checkpoint jobs, which will result in
@@ -206,32 +323,81 @@ fraction of the longer sequence that must be explained by tiled copies;
 significance test — raise `max_null_passes` above 0 only if you want a more
 permissive (less strict) confirmation criterion.
 
+**`copy_number_filter`** — `min_total_copy_number` (default 500) is the
+per-entry cluster filter applied in `filter_and_pool_clusters`, before
+cross-entry pooling. Check `results/copy_number_diagnostic.png` (a
+log-scaled histogram of every entry's pre-filter `total_copy_number`
+values with this threshold marked) to confirm it sits in a real gap
+between background noise and true arrays before trusting a run — and if
+the histogram alone doesn't show a clean gap (a real, not hypothetical,
+failure mode: a noisy plateau with no clear valley), cross-check against
+`results/copy_number_qc_scatter.png` (copy number vs. period length /
+percent-match / entropy) and, after a run completes,
+`results/copy_number_vs_recurrence.png` (copy number vs. how many
+entries/methods independently confirmed each family) before deciding the
+threshold is placed well. A middling-copy-number family confirmed across
+several entries/methods is stronger evidence than an equally-scored family
+found only once — recurrence a single static per-entry threshold can't
+see on its own, and a reason a more permissive threshold can be a
+defensible choice once you're leaning on that cross-check too.
+
+**`visualization`** — `top_n_families` (default 20) controls how many bars
+`plot_top_families` draws per individual and in the global ranking plot.
+
 **`known_repeat_screen`** — `species` is the RepeatMasker `-species` value;
 `double_sequences` (default true) controls the rotation-tolerant doubling
 trick. See "Known-repeat screening" below for the full rationale.
 
 ## Outputs
 
-- `results/candidate_periods.tsv` / `candidate_periods_raw.tsv` /
-  `candidate_periods_manifest.tsv` — the scan's output (see
+Per-entry (namespaced under `results/{entry_id}/...`):
+- `results/{entry_id}/candidate_periods.tsv` / `candidate_periods_raw.tsv` /
+  `candidate_periods_manifest.tsv` — that entry's scan output (see
   `scan_dat_candidates.py` docstring for column definitions)
-- `results/{motif}/01_raw_consensus.fasta` + `.tsv` — extracted per-locus
-  consensus motifs + provenance for that bin
-- `results/{motif}/ranked_clusters/rank01_n<N>.fasta`, `rank02_...`, etc. —
-  one consensus per cluster found in that bin
-- `results/{motif}/ranked_clusters_summary.tsv` — per-bin cluster ranking
-- `results/all_clusters.tsv` — every cluster from every bin, one master table
-- `results/all_clusters_consensus.fasta` — every cluster's consensus, combined
+- `results/{entry_id}/{motif}/01_raw_consensus.fasta` + `.tsv` — extracted
+  per-locus consensus motifs + provenance for that bin (haplotype-pooled
+  for a `phased_pooled` entry)
+- `results/{entry_id}/{motif}/ranked_clusters/rank01_n<N>.fasta`,
+  `rank02_...`, etc. — one consensus per cluster found in that bin
+- `results/{entry_id}/{motif}/ranked_clusters_summary.tsv` — per-bin
+  cluster ranking, including `total_copy_number` and the
+  copy-number-weighted `mean_percent_match` / `mean_entropy` (TRF's own
+  per-locus quality fields, averaged across the cluster's raw loci)
+- `results/{entry_id}/all_clusters.tsv` — every cluster from every bin of
+  this entry, one master table
+- `results/{entry_id}/all_clusters_consensus.fasta` — every cluster's
+  consensus for this entry, combined
+
+Across entries:
+- `results/copy_number_diagnostic.png` — pre-filter `total_copy_number`
+  distribution across every entry, with the `min_total_copy_number`
+  threshold marked
+- `results/copy_number_qc_scatter.png` — the same pre-filter clusters,
+  `total_copy_number` (log x-axis, colored by pass/fail) vs. `target_period`
+  / `mean_percent_match` / `mean_entropy`, for when the histogram alone
+  doesn't show a clean noise/signal gap
+- `results/filtered_pooled_clusters.tsv` — every entry's surviving clusters
+  (post-filter), pooled, `cluster_uid = {entry_id}__{source_cluster_label}`
+- `results/pooled_consensus.fasta` — every surviving cluster's consensus,
+  headers = `cluster_uid`
 - `results/cross_cluster_comparison.tsv` — pairwise similarity/multiple-of
-  check across every cluster found
+  check across every pooled cluster
 - `results/repeatmasker_custom_lib.fasta` — **final output**: every
-  cluster's consensus, headers as `>{label}#{classification}` (winners) or
-  `>{label}#{classification}/redundant_with_{winner}` (demoted)
-- `results/summary_table.tsv` — **final output**: `all_clusters.tsv` plus
-  `is_redundant` / `redundant_with` / `group_size`
-- `results/known_repeat_hits.tsv` — **final output**: every cluster's
-  `label` joined against a Dfam/RepBase known-repeat screen, see
-  "Known-repeat screening" below
+  pooled cluster's consensus, headers as
+  `>{final_name}__{entry_id}#{classification}` (family representatives) or
+  `>{final_name}__{entry_id}#{classification}/redundant_with_{final_name}`
+  (other family members)
+- `results/summary_table.tsv` — **final output**: one row per original
+  cluster call, named/grouped into families with provenance — see the
+  columns table below
+- `results/known_repeat_hits.tsv` — **final output**: every library entry
+  joined against a Dfam/RepBase known-repeat screen, see "Known-repeat
+  screening" below
+- `results/top_families_{individual}.png`, `results/top_families_global.png`
+  — **final output**: family-ranking bar charts, see "Pipeline" step 10
+- `results/copy_number_vs_recurrence.png` — **final output**: one point per
+  family, representative `total_copy_number` vs. `n_entries_found` /
+  `n_methods_confirming`, see "Pipeline" step 11
 
 ## Known-repeat screening
 
@@ -291,15 +457,17 @@ was contained to that directory, `rm -rf RM_*` in the repo root).
   real match wraps around the end of a single un-doubled copy. Same trick
   used internally elsewhere in this pipeline (`cross_motif_comparison.py`).
 
-**Reading `known_repeat_hits.tsv`**: every cluster `label` (same join key
-as `summary_table.tsv`) is present, but **this is not guaranteed to be one
-row per label** — a label with no hit gets exactly one row
+**Reading `known_repeat_hits.tsv`**: every library entry (identified by its
+FASTA header up to the first `#`, i.e. `{final_name}__{entry_id}` — the
+same join key you'd reconstruct from `summary_table.tsv`'s `final_name` +
+`source_entry_id`) is present, but **this is not guaranteed to be one row
+per entry** — an entry with no hit gets exactly one row
 (`has_known_hit=False`, rest `NA`), a normal, common, and often *expected*
 outcome, not a failure (much of the satellite DNA in a non-model species
-genome is genuinely undescribed in existing databases); a label with hits
+genome is genuinely undescribed in existing databases); an entry with hits
 gets **one row per distinct matched repeat name**, so a motif that matches
 two unrelated known families shows up as two rows. If you need exactly one
-row per label (e.g. for a simple join), sort by `reciprocal_overlap`
+row per entry (e.g. for a simple join), sort by `reciprocal_overlap`
 descending and keep the first row per label. `repeat_name` /
 `repeat_class_family` identify each match, `sw_score` / `pct_divergence`
 describe its quality, and:
@@ -395,29 +563,47 @@ informative if the library actually had something to compare against.
 
 ## `results/summary_table.tsv` columns
 
+One row per original cluster call — nothing dropped, non-representative
+family members are kept and marked `is_representative=False`.
+
 | column | meaning |
 |---|---|
-| `label` | unique ID, `{motif}_rank{rank}_n{N}` — matches the FASTA header in `repeatmasker_custom_lib.fasta` |
-| `motif` / `target_period` / `window` | which scan bin this cluster came from |
-| `rank` | this cluster's size rank *within its bin* (1 = most loci in that bin) |
-| `n_input_sequences` | loci that joined this specific cluster — the core "how much support" number |
-| `pct_of_bin` | `n_input_sequences` as a % of the bin's total loci |
-| `consensus_length` / `gc_content` | of this cluster's consensus sequence |
-| `is_redundant` | True if this cluster lost a redundancy comparison to another (higher-support) cluster |
-| `redundant_with` | the winning cluster's `label`, if `is_redundant` |
-| `group_size` | how many clusters (across the whole run) got grouped together as redundant with each other |
+| `final_name` | `SAT{motif_length}_{letter}` — the harmonized family name. Matches the FASTA header prefix in `repeatmasker_custom_lib.fasta` (`{final_name}__{source_entry_id}`) |
+| `motif_length` | the family's representative cluster's own exact `consensus_length` (no rounding/averaging) |
+| `is_representative` | True for the one row per family with the highest `source_copy_number` — its consensus is what goes in the RepeatMasker library unqualified; other rows are `#Satellite/redundant_with_{final_name}` |
+| `source_entry_id` / `source_individual` / `source_assembly_method` / `source_phasing_status` | which manifest entry this specific cluster call came from |
+| `source_cluster_label` | that entry's own cluster label (`{motif}_rank{rank}_n{N}`), before pooling |
+| `source_copy_number` | this cluster's own `total_copy_number` (summed raw TRF copy number, not locus count) — the ranking key resolve_redundancy used |
+| `source_consensus_length` / `source_gc_content` | of this specific cluster's own consensus (can differ slightly from `motif_length` — see "Pipeline" step 9) |
+| `n_entries_found` / `entries_found` | how many / which manifest entries this family was found in at all |
+| `n_individuals_present` / `individuals_found` | how many / which individuals this family was found in |
+| `n_methods_confirming` / `methods_found` | how many / which assembly methods this family was found in |
 
 ## Sanity checks worth doing on real data
 
-- Sort `summary_table.tsv` by `n_input_sequences` descending — your
-  strongest centromeric/large-satellite candidates are at the top,
-  regardless of which bin they came from.
-- Check `group_size` for anything > 1 — that cluster was found to be
-  redundant with something else; `redundant_with` tells you which cluster
-  won and why (compare `n_input_sequences` between the two).
-- A bin producing zero clusters (missing from `all_clusters.tsv` entirely)
-  means every locus in that bin failed to join a cluster of `min_cluster_size`
-  — the bin wasn't coherent enough to be trustworthy, not a bug.
+- Sort by `is_representative` then `source_copy_number` descending within a
+  family, or just eyeball `results/top_families_global.png` — your
+  strongest, most-confirmed candidates are the ones with a tall bar colored
+  "found in >1 individual."
+- `n_individuals_present` / `n_methods_confirming` are the new cross-checks
+  worth scanning: a family private to one individual *and* one method is a
+  weaker claim than one confirmed across individuals and methods — compare
+  against `results/copy_number_diagnostic.png` too, since a private,
+  low-copy-number family sitting just above the filter threshold is worth
+  a second look.
+- `SAT{motif_length}_a` / `SAT{motif_length}_b` sharing a `motif_length` are
+  **not** the same family — the letter, not the length, disambiguates them;
+  don't assume they should be merged just because they share a number.
+- A bin producing zero clusters (missing from that entry's `all_clusters.tsv`
+  entirely) means every locus in that bin failed to join a cluster of
+  `min_cluster_size` — the bin wasn't coherent enough to be trustworthy, not
+  a bug.
 - Eyeball a cluster's `ranked_clusters/rank0N_*.fasta` against
   `01_raw_consensus.fasta` in an alignment viewer before fully trusting a
   borderline consensus, especially one near the `min_cluster_size` floor.
+- Ties in `source_copy_number` when resolving which cluster becomes a
+  family's representative break deterministically but not obviously — via
+  the order clusters appear in `filtered_pooled_clusters.tsv` (itself
+  manifest-row order × per-entry bin/rank order), not an explicit tiebreak
+  rule. Not usually worth worrying about, but worth knowing if two runs
+  ever appear to disagree on which near-identical-support cluster won.

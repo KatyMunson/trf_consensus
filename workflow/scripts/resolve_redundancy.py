@@ -2,9 +2,11 @@
 """
 resolve_redundancy.py
 
-Takes the master cluster table (all_clusters.tsv), the pairwise comparison
-(cross_cluster_comparison.tsv: flag_similar / flag_multiple_of), and the
-combined consensus FASTA, and resolves redundancy.
+Takes the pooled cross-entry cluster table (filtered_pooled_clusters.tsv),
+the pairwise comparison (cross_cluster_comparison.tsv: flag_similar /
+flag_multiple_of, keyed on cluster_uid now that clusters are pooled across
+entries), and the pooled consensus FASTA, and resolves redundancy into
+named families.
 
 IMPORTANT — this does NOT use transitive union-find over flagged pairs.
 An earlier version did, and it produced meaningless mega-groups: if A~B is
@@ -15,26 +17,44 @@ dozens of genuinely unrelated candidates spanning an enormous period range
 into one "family," with no cluster in the group ever compared to most of
 the others.
 
-Instead: process clusters in descending support order (highest
-n_input_sequences first). Each cluster is checked ONLY against clusters
-already confirmed as group winners so far — never against another loser,
-never chained through an intermediate. If it's flagged as similar to or a
-multiple of an existing winner, it's marked redundant with THAT winner
-specifically (a direct, individually-verified relationship). Otherwise it
-becomes a new winner itself. This is the same non-chained pattern used to
-fix the equivalent bug in the old triage_candidates.py.
+Instead: process clusters in descending total_copy_number order (the
+per-entry summed TRF copy number backing each cluster, not raw locus
+count — see rank_family_clusters.py). Each cluster is checked ONLY against
+clusters already confirmed as group winners so far — never against
+another loser, never chained through an intermediate. If it's flagged as
+similar to or a multiple of an existing winner, it joins that winner's
+family; otherwise it becomes a new winner (and the representative of a new
+family) itself. Same non-chained pattern as before.
 
-Nothing is dropped — every cluster still appears in the final outputs, but
-losers are marked redundant and demoted (both in the summary table and in
-the RepeatMasker library's classification field) rather than removed.
+Naming: every newly-confirmed winner gets final_name = "SAT{motif_length}_
+{letter}", where motif_length is the WINNER'S OWN exact consensus_length
+(no rounding/averaging — different entries can legitimately disagree by a
+base or two, since each ran its own independent MSA/consensus over a
+different input pool). The letter disambiguates families that happen to
+share a motif_length: assigned in winner-discovery order (i.e. descending
+total_copy_number among winners), per-length, starting at 'a'.
+
+Provenance columns (n_entries_found/entries_found, n_individuals_present/
+individuals_found, n_methods_confirming/methods_found) are computed once
+per family and repeated on every row belonging to it. entries_found is
+sorted(set(entry_id)); individuals_found/methods_found are derived by
+walking entries_found in that same sorted order and deduping each entry's
+individual/method while preserving first-occurrence order (not an
+alphabetical sort of the values themselves).
+
+Nothing is dropped — every original cluster call still appears in the
+final outputs, but non-representative members of a family are marked
+is_representative=False and demoted in the RepeatMasker library's
+classification field, rather than removed.
 
 Outputs:
   --out-lib-fasta: EVERY cluster's consensus, headers as
-      >{label}#{classification} for winners, and
-      >{label}#{classification}/redundant_with_{winner} for demoted ones.
-      Sorted winners-first, then by support.
-  --out-summary: all_clusters.tsv plus is_redundant / redundant_with /
-      group_size columns — the final master QC table.
+      >{final_name}__{entry_id}#{classification} for the representative, and
+      >{final_name}__{entry_id}#{classification}/redundant_with_{final_name}
+      for other family members. Sorted family-discovery-order, representative
+      first within each family.
+  --out-summary: one row per original cluster call — the final harmonized
+      master QC table.
 """
 import argparse
 import sys
@@ -68,11 +88,24 @@ def read_multi_fasta(path):
     return seqs
 
 
+def letter_for_index(n):
+    """Bijective base-26 letters for n=0,1,2,...: a, b, ..., z, aa, ab, ...,
+    az, ba, ... — so a motif_length shared by more than 26 families doesn't
+    IndexError, however unlikely that is for real satellite data."""
+    n += 1
+    s = ""
+    while n > 0:
+        n -= 1
+        s = chr(ord("a") + n % 26) + s
+        n //= 26
+    return s
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--clusters-tsv", required=True, help="all_clusters.tsv")
+    ap.add_argument("--clusters-tsv", required=True, help="filtered_pooled_clusters.tsv")
     ap.add_argument("--comparison-tsv", required=True, help="cross_cluster_comparison.tsv")
-    ap.add_argument("--consensus-fasta", required=True, help="all_clusters_consensus.fasta")
+    ap.add_argument("--consensus-fasta", required=True, help="pooled_consensus.fasta")
     ap.add_argument("--classification", default="Satellite")
     ap.add_argument("--out-lib-fasta", required=True)
     ap.add_argument("--out-summary", required=True)
@@ -82,60 +115,124 @@ def main():
     comparisons = read_tsv(args.comparison_tsv)
     seqs = read_multi_fasta(args.consensus_fasta)
 
-    by_label = {c["label"]: c for c in clusters}
+    out_columns = [
+        "final_name", "motif_length", "is_representative", "source_entry_id",
+        "source_cluster_label", "source_individual", "source_assembly_method",
+        "source_phasing_status", "source_copy_number", "source_consensus_length",
+        "source_gc_content", "n_entries_found", "entries_found", "n_individuals_present",
+        "individuals_found", "n_methods_confirming", "methods_found",
+    ]
 
-    # flagged[label] -> set of OTHER labels it's flagged similar/multiple-of
+    if not clusters:
+        sys.stderr.write(
+            "[resolve_redundancy] no clusters in --clusters-tsv (everything filtered out "
+            "upstream?) — writing header-only outputs\n"
+        )
+        with open(args.out_summary, "w") as out:
+            out.write("\t".join(out_columns) + "\n")
+        open(args.out_lib_fasta, "w").close()
+        return
+
+    by_uid = {c["cluster_uid"]: c for c in clusters}
+
+    # flagged[uid] -> set of OTHER cluster_uids it's flagged similar/multiple-of
     flagged = defaultdict(set)
     n_edges = 0
     for r in comparisons:
         if r.get("flag_similar") == "True" or r.get("flag_multiple_of") == "True":
             a, b = r["label_A"], r["label_B"]
-            if a in by_label and b in by_label:
+            if a in by_uid and b in by_uid:
                 flagged[a].add(b)
                 flagged[b].add(a)
                 n_edges += 1
 
-    ranked = sorted(clusters, key=lambda c: int(c["n_input_sequences"]), reverse=True)
+    ranked = sorted(clusters, key=lambda c: float(c["total_copy_number"]), reverse=True)
 
-    winners = []          # labels confirmed as winners so far, in order found
-    redundant_with = {}   # label -> winner label
-    group_members = defaultdict(list)  # winner label -> list of labels redundant with it (incl. itself)
+    winners = []                       # winner cluster_uids, in discovery order
+    redundant_with = {}                # loser cluster_uid -> winner cluster_uid
+    group_members = defaultdict(list)  # winner cluster_uid -> [winner, loser, loser, ...]
 
     for c in ranked:
-        label = c["label"]
+        uid = c["cluster_uid"]
         match = None
         for w in winners:
-            if w in flagged[label]:
+            if w in flagged[uid]:
                 match = w
-                break  # winners list is already support-sorted; first hit is the strongest
+                break  # winners is already support-sorted; first hit is the strongest
         if match is None:
-            winners.append(label)
-            group_members[label].append(label)
+            winners.append(uid)
+            group_members[uid].append(uid)
         else:
-            redundant_with[label] = match
-            group_members[match].append(label)
+            redundant_with[uid] = match
+            group_members[match].append(uid)
 
-    group_size_of = {}
-    for winner, members in group_members.items():
-        for m in members:
-            group_size_of[m] = len(members)
+    # --- naming: one final_name per winner, letters disambiguate shared motif_length ---
+    letter_counter = defaultdict(int)
+    final_name_of_winner = {}
+    for w in winners:
+        motif_length = int(by_uid[w]["consensus_length"])
+        letter = letter_for_index(letter_counter[motif_length])
+        letter_counter[motif_length] += 1
+        final_name_of_winner[w] = f"SAT{motif_length}_{letter}"
 
-    # --- final summary table ---
-    out_columns = ["label", "motif", "target_period", "window", "rank",
-                   "n_input_sequences", "pct_of_bin", "consensus_length", "gc_content",
-                   "is_redundant", "redundant_with", "group_size"]
+    # --- per-family provenance, computed once per winner ---
+    provenance = {}
+    for w in winners:
+        members = group_members[w]
+        entries_found = sorted({by_uid[m]["entry_id"] for m in members})
+
+        def dedup_in_entry_order(field):
+            seen = []
+            for entry_id in entries_found:
+                value = next(by_uid[m][field] for m in members if by_uid[m]["entry_id"] == entry_id)
+                if value not in seen:
+                    seen.append(value)
+            return seen
+
+        individuals_found = dedup_in_entry_order("individual")
+        methods_found = dedup_in_entry_order("assembly_method")
+        provenance[w] = {
+            "n_entries_found": len(entries_found), "entries_found": ";".join(entries_found),
+            "n_individuals_present": len(individuals_found),
+            "individuals_found": ";".join(individuals_found),
+            "n_methods_confirming": len(methods_found), "methods_found": ";".join(methods_found),
+        }
+
+    # --- final summary table, family-discovery order, representative first within each family ---
     rows_out = []
-    for c in clusters:
-        label = c["label"]
-        is_redundant = label in redundant_with
-        row = dict(c)
-        row["is_redundant"] = is_redundant
-        row["redundant_with"] = redundant_with.get(label, "NA")
-        row["group_size"] = group_size_of[label]
-        rows_out.append(row)
+    for w in winners:
+        final_name = final_name_of_winner[w]
+        motif_length = int(by_uid[w]["consensus_length"])
+        prov = provenance[w]
+        for uid in group_members[w]:
+            c = by_uid[uid]
+            rows_out.append({
+                "final_name": final_name, "motif_length": motif_length,
+                "is_representative": uid == w,
+                "source_entry_id": c["entry_id"], "source_cluster_label": c["source_cluster_label"],
+                "source_individual": c["individual"], "source_assembly_method": c["assembly_method"],
+                "source_phasing_status": c["phasing_status"],
+                "source_copy_number": c["total_copy_number"],
+                "source_consensus_length": c["consensus_length"],
+                "source_gc_content": c["gc_content"],
+                **prov,
+            })
 
-    # Winners first, then by support descending
-    rows_out.sort(key=lambda r: (r["is_redundant"], -int(r["n_input_sequences"])))
+    # A family with two rows from the same entry_id would collide on the
+    # library FASTA's header ({final_name}__{entry_id}); fail loudly rather
+    # than invent an unverified disambiguation scheme for a case the spec's
+    # worked example never exercises.
+    seen_header_keys = set()
+    for row in rows_out:
+        key = (row["final_name"], row["source_entry_id"])
+        if key in seen_header_keys:
+            sys.exit(
+                f"ERROR: family '{row['final_name']}' has more than one cluster from entry "
+                f"'{row['source_entry_id']}' — the {{final_name}}__{{entry_id}} library header "
+                f"format can't disambiguate them. Resolve manually (this is not expected to "
+                f"happen for one cluster-per-bin-per-entry input)."
+            )
+        seen_header_keys.add(key)
 
     with open(args.out_summary, "w") as out:
         out.write("\t".join(out_columns) + "\n")
@@ -144,22 +241,24 @@ def main():
 
     # --- final RepeatMasker library ---
     with open(args.out_lib_fasta, "w") as out:
-        for row in rows_out:
-            label = row["label"]
-            seq = seqs.get(label, "")
-            if not seq:
-                continue
-            if row["is_redundant"]:
-                classification = f"{args.classification}/redundant_with_{row['redundant_with']}"
-            else:
-                classification = args.classification
-            out.write(f">{label}#{classification}\n{seq}\n")
+        for w in winners:
+            final_name = final_name_of_winner[w]
+            for uid in group_members[w]:
+                c = by_uid[uid]
+                seq = seqs.get(uid, "")
+                if not seq:
+                    continue
+                header_name = f"{final_name}__{c['entry_id']}"
+                if uid == w:
+                    classification = args.classification
+                else:
+                    classification = f"{args.classification}/redundant_with_{final_name}"
+                out.write(f">{header_name}#{classification}\n{seq}\n")
 
-    n_redundant = sum(1 for r in rows_out if r["is_redundant"])
-    max_group = max(group_size_of.values()) if group_size_of else 0
+    n_redundant = sum(1 for r in rows_out if not r["is_representative"])
     sys.stderr.write(
         f"[resolve_redundancy] {len(clusters)} clusters, {n_edges} flagged relationships, "
-        f"{len(winners)} winners, {n_redundant} marked redundant, largest group={max_group}\n"
+        f"{len(winners)} families, {n_redundant} non-representative members\n"
     )
 
 

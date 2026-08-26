@@ -5,12 +5,21 @@
 # no manually-curated periods.tsv. See Snakefile header for the full flow.
 # =============================================================================
 
-# Path to the TRF .dat file (native TRF output, not the .bed conversion)
-trf_dat: "/path/to/trf.dat"
+# Manifest of entries to run the pipeline over. One row per individual x
+# assembly-method combination ("entry"), tab-separated, columns: entry_id,
+# individual, assembly_method, phasing_status (phased_pooled|unphased),
+# fasta_paths, trf_dat_paths. phased_pooled entries give two ;-separated
+# haplotype paths (pooled at calling time); unphased entries give one. Only
+# trf_dat_paths is actually read by the pipeline -- fasta_paths is
+# provenance/documentation only. See config/manifest.example.tsv for a
+# worked example and the README's "Manifest" section for the full schema.
+manifest: "config/manifest.tsv"
 
-# Source contig/scaffold name to label entries with when the .dat file has
-# no header lines at all (neither "Sequence: <name>" nor "@<name>" -ngs
-# style). Leave "" if your .dat has real headers.
+# Source contig/scaffold name to label entries with when a .dat file has no
+# header lines at all (neither "Sequence: <name>" nor "@<name>" -ngs style).
+# Leave "" if your .dat files have real headers. This is a single global
+# fallback applied uniformly to every manifest entry, not configurable per
+# entry.
 trf_dat_default_seqname: ""
 
 # RepeatMasker library classification suffix, e.g. "Satellite" or
@@ -65,6 +74,19 @@ cross_cluster_comparison:
   max_null_passes: 0           # a pair is only confirmed if at most this many shuffled trials also pass
                                 # min_coverage (default 0 = ALL shuffles must fail to confirm real signal)
 
+# --- Stage 3: per-entry cluster filter + cross-entry pooling ---
+# Applied per entry, before pooling: a cluster's summed TRF copy number
+# across its raw loci must meet this to survive into cross-entry comparison.
+# results/copy_number_diagnostic.png (Stage 2b) plots every entry's
+# pre-filter total_copy_number distribution with this threshold marked, to
+# sanity-check it sits in a real gap between noise and signal.
+copy_number_filter:
+  min_total_copy_number: 500
+
+# --- Stage 6: family ranking visualizations ---
+visualization:
+  top_n_families: 20  # bars drawn per individual and in the global ranking plot
+
 # --- Step 4: known-repeat screening (results/known_repeat_hits.tsv) ---
 # Runs RepeatMasker with -species against our OWN discovered consensus
 # motifs (not the assembly) to check whether any match a previously
@@ -117,7 +139,27 @@ resources:
     threads: 1
     mem: 2
     hrs: 4
+  filter_and_pool_clusters:
+    threads: 1
+    mem: 2
+    hrs: 1
+  plot_copy_number_diagnostic:
+    threads: 1
+    mem: 2
+    hrs: 1
+  plot_copy_number_qc_diagnostic:
+    threads: 1
+    mem: 2
+    hrs: 1
   resolve_redundancy:
+    threads: 1
+    mem: 2
+    hrs: 1
+  plot_top_families:
+    threads: 1
+    mem: 2
+    hrs: 1
+  plot_copy_number_vs_recurrence:
     threads: 1
     mem: 2
     hrs: 1
