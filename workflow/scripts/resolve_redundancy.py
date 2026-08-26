@@ -50,6 +50,31 @@ deliberately NOT summed across what it consolidated, since overlapping
 bin extraction windows (period +/- window) mean the same raw TRF loci
 could plausibly have been double-counted into more than one bin already.
 
+The pre-pass alone is not sufficient: two same-entry sub-winners can also
+converge on the same family INDIRECTLY, via independent links to a shared
+EXTERNAL winner, without ever being directly flagged against each other —
+confirmed on real data (two clusters each >= threshold against a common
+external winner, but below min_coverage against each other, so
+flag_similar/flag_multiple_of both False for the direct pair). The
+pre-pass has no visibility into this: it only ever compares candidates
+within one entry, never against a shared external target that's only
+discovered once the global pass runs. So a second, POST-GLOBAL
+deduplication pass runs immediately after the global resolve_winners()
+call: within each winner's group_members[w], if more than one member
+shares an entry_id (only possible via this indirect-convergence path,
+since the pre-pass already ruled out direct same-entry duplicates), the
+highest-total_copy_number one is kept and the rest are re-homed under it
+(along with anything they'd already consolidated within their own entry).
+`w` itself is always correctly kept when it's the duplicated entry, since
+resolve_winners()'s ranked processing guarantees w has the highest copy
+number among everything in its own group. Together, the two passes give a
+structurally exhaustive guarantee: group_members[w] is the complete
+definition of family membership, and there are exactly two ways a cluster
+joins it (pre-pass within-entry consolidation, or direct/global match
+against w) — both are now deduplicated by entry_id, so no two same-entry
+clusters can reach the final output claiming the same family, direct or
+indirect.
+
 Naming: every newly-confirmed winner gets final_name = "SAT{motif_length}_
 {letter}", where motif_length is the WINNER'S OWN exact consensus_length
 (no rounding/averaging — different entries can legitimately disagree by a
@@ -223,12 +248,43 @@ def main():
         all_subwinners.extend(sub_winners)
         entry_group_members.update(sub_group_members)
 
-    n_within_entry_consolidated = sum(len(members) - 1 for members in entry_group_members.values())
-
     # --- global pass: unchanged algorithm, now run over sub-winners only.
     # Each sub-winner's total_copy_number is used as-is (not summed across
     # what it consolidated) -- see module docstring. ---
     winners, group_members, redundant_with = resolve_winners(all_subwinners, flagged, by_uid)
+
+    # --- post-global consolidation: within any single family, at most one
+    # sub-winner may represent a given entry (the {final_name}__{entry_id}
+    # header format requires this). Two same-entry sub-winners can converge
+    # on the same family via independent links to a shared external winner
+    # without ever being directly flagged against each other -- the
+    # within-entry pre-pass above cannot catch this by design (it only ever
+    # compares candidates within one entry, never against a shared external
+    # target discovered later in this global pass). Resolved here as a
+    # final tie-break: for every family, if more than one member sub-winner
+    # shares an entry_id, keep the highest-total_copy_number one and
+    # re-home the rest -- and everything THEY had already consolidated
+    # within their own entry -- under it. `w` is always the keeper when
+    # it's the duplicated entry, since resolve_winners() guarantees w has
+    # the highest copy number in its own group (every other member was
+    # necessarily processed, and so ranked lower, after w was confirmed). ---
+    for w in winners:
+        by_entry = defaultdict(list)
+        for uid in group_members[w]:
+            by_entry[by_uid[uid]["entry_id"]].append(uid)
+        for entry_id, uids in by_entry.items():
+            if len(uids) <= 1:
+                continue
+            uids_ranked = sorted(uids, key=lambda u: float(by_uid[u]["total_copy_number"]), reverse=True)
+            keep, extras = uids_ranked[0], uids_ranked[1:]
+            for extra in extras:
+                group_members[w].remove(extra)
+                entry_group_members[keep].extend(entry_group_members.pop(extra))
+
+    # Computed after both consolidation passes so a cluster only folded in
+    # by the post-global pass above (previously its own top-level
+    # sub-winner) is correctly counted as consolidated within-entry.
+    n_within_entry_consolidated = sum(len(members) - 1 for members in entry_group_members.values())
 
     # --- naming: one final_name per winner, letters disambiguate shared motif_length ---
     letter_counter = defaultdict(int)

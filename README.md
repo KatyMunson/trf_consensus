@@ -207,6 +207,26 @@ plot_copy_number_vs_recurrence  (results/copy_number_vs_recurrence.png)
    what it consolidated — bin extraction windows (`period ± window`) can
    overlap, so summing risks double-counting the same raw TRF loci.
 
+   **Post-global same-entry deduplication**: the pre-pass alone isn't
+   sufficient — two same-entry sub-winners can also converge on the same
+   family *indirectly*, via independent links to a shared *external*
+   winner, without ever being directly flagged against each other (real
+   case: two clusters each independently cleared threshold against a
+   common external winner, but scored below `min_coverage` against each
+   other, so `flag_similar`/`flag_multiple_of` were both `False` for the
+   direct pair). The pre-pass can't see this — it only ever compares
+   candidates within one entry, never against a shared external target
+   that's only discovered once the global pass runs. So a second pass runs
+   immediately after the global pass: within each family, if more than one
+   member sub-winner shares an `entry_id`, the highest-`total_copy_number`
+   one is kept and the rest are re-homed under it (along with anything
+   they'd already consolidated within their own entry). Together, the two
+   passes give a structurally exhaustive guarantee — there are exactly two
+   ways a cluster can join a family (pre-pass within-entry consolidation,
+   or a direct/global match against the family's representative), and both
+   are now deduplicated by `entry_id`, so no two same-entry clusters can
+   reach the final output claiming the same family, direct or indirect.
+
    Nothing is dropped from the summary table — every original cluster call
    still gets a row, non-representative members kept and marked
    `is_representative=False`. The final RepeatMasker library is narrower:
