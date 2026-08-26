@@ -208,7 +208,8 @@ checkpoint scan_dat_candidates:
     # for this entry is determined here, at runtime, not known when the
     # DAG is built.
     input:
-        dat=entry_dat_paths
+        dat=entry_dat_paths,
+        script="workflow/scripts/scan_dat_candidates.py"
     output:
         tsv="results/{entry_id}/candidate_periods.tsv",
         raw_tsv="results/{entry_id}/candidate_periods_raw.tsv",
@@ -239,7 +240,8 @@ checkpoint scan_dat_candidates:
 rule extract_by_period:
     input:
         dat=entry_dat_paths,
-        manifest=lambda wc: checkpoints.scan_dat_candidates.get(entry_id=wc.entry_id).output.manifest
+        manifest=lambda wc: checkpoints.scan_dat_candidates.get(entry_id=wc.entry_id).output.manifest,
+        script="workflow/scripts/extract_by_period.py"
     output:
         fasta="results/{entry_id}/{motif}/01_raw_consensus.fasta",
         tsv="results/{entry_id}/{motif}/01_raw_consensus.tsv"
@@ -270,7 +272,8 @@ rule rank_family_clusters:
     # cluster count per bin isn't known ahead of time.
     input:
         fasta="results/{entry_id}/{motif}/01_raw_consensus.fasta",
-        tsv="results/{entry_id}/{motif}/01_raw_consensus.tsv"
+        tsv="results/{entry_id}/{motif}/01_raw_consensus.tsv",
+        script="workflow/scripts/rank_family_clusters.py"
     output:
         clusters_dir=directory("results/{entry_id}/{motif}/ranked_clusters"),
         summary="results/{entry_id}/{motif}/ranked_clusters_summary.tsv"
@@ -301,7 +304,8 @@ rule build_all_clusters_table:
         summaries=lambda wc: expand("results/{entry_id}/{motif}/ranked_clusters_summary.tsv",
                                      entry_id=wc.entry_id, motif=all_motifs(wc)),
         dirs=lambda wc: expand("results/{entry_id}/{motif}/ranked_clusters",
-                                entry_id=wc.entry_id, motif=all_motifs(wc))
+                                entry_id=wc.entry_id, motif=all_motifs(wc)),
+        script="workflow/scripts/build_all_clusters_table.py"
     output:
         "results/{entry_id}/all_clusters.tsv"
     params:
@@ -358,7 +362,8 @@ rule plot_copy_number_diagnostic:
     # threshold used in filter_and_pool_clusters can be sanity-checked
     # before committing to a rerun.
     input:
-        clusters_tsv=expand("results/{entry_id}/all_clusters.tsv", entry_id=ENTRY_IDS)
+        clusters_tsv=expand("results/{entry_id}/all_clusters.tsv", entry_id=ENTRY_IDS),
+        script="workflow/scripts/plot_copy_number_diagnostic.py"
     output:
         "results/copy_number_diagnostic.png"
     log:
@@ -383,7 +388,8 @@ rule plot_copy_number_qc_diagnostic:
     # (mean_percent_match, mean_entropy), since the plain histogram alone
     # can't resolve an ambiguous noise/signal middle on its own.
     input:
-        clusters_tsv=expand("results/{entry_id}/all_clusters.tsv", entry_id=ENTRY_IDS)
+        clusters_tsv=expand("results/{entry_id}/all_clusters.tsv", entry_id=ENTRY_IDS),
+        script="workflow/scripts/plot_copy_number_qc_diagnostic.py"
     output:
         "results/copy_number_qc_scatter.png"
     log:
@@ -404,7 +410,8 @@ rule plot_copy_number_qc_diagnostic:
 rule filter_and_pool_clusters:
     input:
         clusters_tsv=expand("results/{entry_id}/all_clusters.tsv", entry_id=ENTRY_IDS),
-        fastas=expand("results/{entry_id}/all_clusters_consensus.fasta", entry_id=ENTRY_IDS)
+        fastas=expand("results/{entry_id}/all_clusters_consensus.fasta", entry_id=ENTRY_IDS),
+        script="workflow/scripts/filter_and_pool_clusters.py"
     output:
         tsv="results/filtered_pooled_clusters.tsv",
         fasta="results/pooled_consensus.fasta"
@@ -438,7 +445,8 @@ rule cross_cluster_comparison:
     # concatenate_cross_cluster_comparison below joins every shard into the
     # single results/cross_cluster_comparison.tsv resolve_redundancy expects.
     input:
-        fasta="results/pooled_consensus.fasta"
+        fasta="results/pooled_consensus.fasta",
+        script="workflow/scripts/cross_motif_comparison.py"
     output:
         "results/cross_cluster_comparison_shard{shard}.tsv"
     log:
@@ -487,7 +495,8 @@ rule resolve_redundancy:
     input:
         clusters_tsv="results/filtered_pooled_clusters.tsv",
         comparison_tsv="results/cross_cluster_comparison.tsv",
-        consensus_fasta="results/pooled_consensus.fasta"
+        consensus_fasta="results/pooled_consensus.fasta",
+        script="workflow/scripts/resolve_redundancy.py"
     output:
         lib_fasta="results/repeatmasker_custom_lib.fasta",
         summary="results/summary_table.tsv"
@@ -511,7 +520,8 @@ rule resolve_redundancy:
 
 rule plot_top_families:
     input:
-        summary="results/summary_table.tsv"
+        summary="results/summary_table.tsv",
+        script="workflow/scripts/plot_top_families.py"
     output:
         global_png="results/top_families_global.png",
         per_individual=expand("results/top_families_{individual}.png", individual=INDIVIDUALS)
@@ -539,7 +549,8 @@ rule plot_copy_number_vs_recurrence:
     # confirmed it — recurrence a single-entry copy-number threshold can't
     # see at all. Purely descriptive; no filtering/ranking logic here.
     input:
-        summary="results/summary_table.tsv"
+        summary="results/summary_table.tsv",
+        script="workflow/scripts/plot_copy_number_vs_recurrence.py"
     output:
         "results/copy_number_vs_recurrence.png"
     log:
@@ -571,7 +582,8 @@ rule prepare_known_repeat_query:
     # doubles each sequence so a database entry starting at a different
     # rotation phase can still align end-to-end.
     input:
-        "results/repeatmasker_custom_lib.fasta"
+        fasta="results/repeatmasker_custom_lib.fasta",
+        script="workflow/scripts/prepare_known_repeat_query.py"
     output:
         "results/known_repeat_screen/query.fasta"
     params:
@@ -588,7 +600,7 @@ rule prepare_known_repeat_query:
         "python/3.11"
     shell:
         "python workflow/scripts/prepare_known_repeat_query.py "
-        "--in-fasta {input} --out-fasta {output} {params.double_flag} > {log} 2>&1"
+        "--in-fasta {input.fasta} --out-fasta {output} {params.double_flag} > {log} 2>&1"
 
 
 rule run_repeatmasker_known_screen:
@@ -654,7 +666,8 @@ rule run_repeatmasker_known_screen:
 rule parse_known_repeat_hits:
     input:
         rm_out="results/known_repeat_screen/query.fasta.out",
-        query_fasta="results/known_repeat_screen/query.fasta"
+        query_fasta="results/known_repeat_screen/query.fasta",
+        script="workflow/scripts/parse_repeatmasker_hits.py"
     output:
         "results/known_repeat_hits.tsv"
     params:
