@@ -36,10 +36,14 @@
 #       min_total_copy_number, then pools every survivor across every entry
 #       into one table (cluster_uid = {entry_id}__{source_cluster_label})
 #       and one concatenated FASTA.
-#   4.  cross_cluster_comparison — pairwise rotation/strand-aware comparison
-#       across every pooled cluster (all entries, all bins, all ranks),
-#       flagging near-identical or integer-multiple pairs. Unchanged logic —
-#       operates purely on sequence content.
+#   4.  cross_cluster_comparison (sharded, num_shards config-controlled) +
+#       concatenate_cross_cluster_comparison — pairwise rotation/strand-aware
+#       comparison across every pooled cluster (all entries, all bins, all
+#       ranks), flagging near-identical or integer-multiple pairs. Same
+#       comparison logic as before, operating purely on sequence content —
+#       now split across num_shards parallel Snakemake jobs and rejoined
+#       into one results/cross_cluster_comparison.tsv, since N (and thus the
+#       O(N^2) pair count) has grown substantially under multi-entry pooling.
 #   5.  resolve_redundancy — processes pooled clusters in descending
 #       total_copy_number order; each cluster is checked only against
 #       already-confirmed winners (never against another loser, never
@@ -85,6 +89,7 @@ import os
 wildcard_constraints:
     entry_id="[^/]+",
     motif="[^/]+",
+    shard="\d+",
 
 
 # --- manifest parsing (static, at load time -- NOT a checkpoint) ---
@@ -136,6 +141,13 @@ if not MANIFEST:
 
 ENTRY_IDS = list(MANIFEST)
 INDIVIDUALS = sorted({v["individual"] for v in MANIFEST.values()})
+
+# Static, user-set fan-out for the cross_cluster_comparison shard rules below
+# (see config's cross_cluster_comparison.num_shards) — unlike scan_dat_candidates'
+# bin list, the pair count this shards over doesn't need to be known before
+# the DAG is built, so a checkpoint isn't needed here.
+NUM_SHARDS = config["cross_cluster_comparison"]["num_shards"]
+SHARD_IDS = list(range(NUM_SHARDS))
 
 
 def entry_dat_paths(wildcards):
@@ -421,12 +433,16 @@ rule filter_and_pool_clusters:
 
 
 rule cross_cluster_comparison:
+    # Shard-indexed: this rule produces one shard's slice of the full pairwise
+    # comparison (see cross_motif_comparison.py's --shard-index/--num-shards).
+    # concatenate_cross_cluster_comparison below joins every shard into the
+    # single results/cross_cluster_comparison.tsv resolve_redundancy expects.
     input:
         fasta="results/pooled_consensus.fasta"
     output:
-        "results/cross_cluster_comparison.tsv"
+        "results/cross_cluster_comparison_shard{shard}.tsv"
     log:
-        "results/logs/cross_cluster_comparison.log"
+        "results/logs/cross_cluster_comparison_shard{shard}.log"
     threads: config["resources"]["cross_cluster_comparison"]["threads"]
     resources:
         mem=lambda wildcards, attempt: config["resources"]["cross_cluster_comparison"]["mem"] * attempt,
@@ -443,7 +459,28 @@ rule cross_cluster_comparison:
         "--max-copies {config[cross_cluster_comparison][max_copies]} "
         "--n-shuffles {config[cross_cluster_comparison][n_shuffles]} "
         "--max-null-passes {config[cross_cluster_comparison][max_null_passes]} "
+        "--null-test-skip-margin {config[cross_cluster_comparison][null_test_skip_margin]} "
+        "--shard-index {wildcards.shard} --num-shards {config[cross_cluster_comparison][num_shards]} "
         "> {log} 2>&1"
+
+
+rule concatenate_cross_cluster_comparison:
+    # Plain concatenation of every shard's TSV (header from shard 0 only)
+    # into the exact filename resolve_redundancy already expects — no
+    # downstream changes needed.
+    input:
+        shards=expand("results/cross_cluster_comparison_shard{shard}.tsv", shard=SHARD_IDS)
+    output:
+        "results/cross_cluster_comparison.tsv"
+    log:
+        "results/logs/concatenate_cross_cluster_comparison.log"
+    threads: config["resources"]["concatenate_cross_cluster_comparison"]["threads"]
+    resources:
+        mem=lambda wildcards, attempt: config["resources"]["concatenate_cross_cluster_comparison"]["mem"] * attempt,
+        hrs=config["resources"]["concatenate_cross_cluster_comparison"]["hrs"]
+    shell:
+        "(head -n1 {input.shards[0]}; "
+        "for f in {input.shards}; do tail -n +2 \"$f\"; done) > {output} 2> {log}"
 
 
 rule resolve_redundancy:

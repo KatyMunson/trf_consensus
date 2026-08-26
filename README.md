@@ -36,7 +36,7 @@ plot_copy_number_qc_diagnostic  (results/copy_number_qc_scatter.png)
 filter_and_pool_clusters  (drop below min_total_copy_number, pool across entries)
         |
         v
-cross_cluster_comparison
+cross_cluster_comparison  (sharded)  ->  concatenate_cross_cluster_comparison
         |
         v
 resolve_redundancy  (names families, annotates provenance)
@@ -146,6 +146,28 @@ plot_copy_number_vs_recurrence  (results/copy_number_vs_recurrence.png)
    otherwise inflate the false-positive rate beyond what the raw identity
    threshold implies, especially for short or compositionally simple
    sequences.
+
+   With multi-entry pooling, the number of pooled clusters compared here
+   (and thus the O(N²) pair count) grows well beyond what the earlier
+   single-assembly pipeline was sized for, so this step gets three
+   performance changes on top of the unchanged comparison logic above:
+   - An **exact, lossless pre-filter**: a pair whose length ratio is too
+     large for `max_copies` tiled copies to ever reach `min_coverage` is
+     skipped before any alignment work, with no accuracy tradeoff — it
+     falls straight out of the existing `max_copies`/`min_coverage` values.
+   - An **opt-in approximation**, `null_test_skip_margin` (default `0.0`,
+     off), that auto-confirms a candidate pair without running the shuffle
+     test when it clears both `min_coverage` and `min_identity` by at least
+     the margin — see the config section below before enabling it.
+   - **Sharding**: the rule runs as `num_shards` parallel Snakemake jobs,
+     each processing a contiguous slice of the pair list via
+     `--shard-index`/`--num-shards`, then `concatenate_cross_cluster_comparison`
+     joins them back into the same `results/cross_cluster_comparison.tsv`
+     filename and schema `resolve_redundancy` already expects. Each
+     candidate pair's shuffle-null RNG is seeded deterministically from
+     `(shuffle_seed, label_A, label_B)` rather than one shared sequential
+     stream, so results are identical regardless of shard count or
+     execution order.
 9. **`resolve_redundancy`** processes pooled clusters in descending
    `total_copy_number` order (not `n_input_sequences` — copy number is the
    fair cross-entry/cross-method support metric now that pooling is
@@ -321,7 +343,21 @@ fraction of the longer sequence that must be explained by tiled copies;
 `max_copies` (6) bounds how many tiled copies are searched for per pair;
 `n_shuffles` (20) and `max_null_passes` (0) control the randomization
 significance test — raise `max_null_passes` above 0 only if you want a more
-permissive (less strict) confirmation criterion.
+permissive (less strict) confirmation criterion. Dropping `n_shuffles` to
+roughly 8-10 is a reasonable way to roughly halve the null-test stage's
+cost while `max_null_passes` stays at 0, if runtime is still an issue after
+sharding — see the comment above the value in `configexample.yaml`.
+
+`num_shards` (default 4) splits the pairwise comparison across this many
+parallel Snakemake jobs (see the `cross_cluster_comparison` step above) —
+raise it for a larger pooled-cluster count / more available SGE slots, or
+set it to 1 to run as a single job like before sharding was added.
+`null_test_skip_margin` (default 0.0, off) is the opt-in shuffle-test
+shortcut described above — leave it at 0.0 unless you've validated a
+nonzero margin against a `margin=0` baseline run on your own data (compare
+`n_flagged` in the log between the two), since it changes the statistical
+guarantee for confirmed pairs. `configexample.yaml` documents two starting
+points (0.05 moderate, 0.10 conservative) if you decide to enable it.
 
 **`copy_number_filter`** — `min_total_copy_number` (default 500) is the
 per-entry cluster filter applied in `filter_and_pool_clusters`, before

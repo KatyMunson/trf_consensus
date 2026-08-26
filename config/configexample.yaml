@@ -70,9 +70,26 @@ cross_cluster_comparison:
   min_identity: 0.70        # per-copy identity required when tiling the shorter sequence against the longer
   min_coverage: 0.85         # fraction of the longer sequence's length that must be explained by tiled copies
   max_copies: 6               # largest number of tiled copies to search for per pair
-  n_shuffles: 20               # mononucleotide-shuffled null trials per candidate-passing pair
+  n_shuffles: 20                # mononucleotide-shuffled null trials per candidate-passing pair. Dropping
+                                 # this to ~8-10 roughly halves the null-test stage's cost, with
+                                 # max_null_passes still at 0 preserving a real (if slightly less powerful)
+                                 # significance test -- worth considering if runtime is still an issue after
+                                 # sharding (num_shards below).
   max_null_passes: 0           # a pair is only confirmed if at most this many shuffled trials also pass
                                 # min_coverage (default 0 = ALL shuffles must fail to confirm real signal)
+  num_shards: 4                 # split the pairwise comparison across this many parallel Snakemake jobs
+                                 # (cross_cluster_comparison rule), rejoined by
+                                 # concatenate_cross_cluster_comparison into the same output filename. Raise
+                                 # for a larger pooled-cluster count / more available SGE slots; set to 1 to
+                                 # run as a single job (identical output either way).
+  null_test_skip_margin: 0.0  # 0.0 = off (current behavior, all candidate pairs null-tested). To trade
+                               # some accuracy for speed once validated on your own data (rerun once with
+                               # margin=0 and compare n_flagged in the log before trusting a nonzero value):
+                               #   0.05 (moderate) - skips the shuffle test for pairs clearing
+                               #     coverage>=0.90 and identity>=0.75 (min_coverage/min_identity + 0.05);
+                               #     null-tests anything more marginal.
+                               #   0.10 (conservative) - requires coverage>=0.95 and identity>=0.80 to
+                               #     skip; fewer pairs qualify, less speedup, safer.
 
 # --- Stage 3: per-entry cluster filter + cross-entry pooling ---
 # Applied per entry, before pooling: a cluster's summed TRF copy number
@@ -139,6 +156,10 @@ resources:
     threads: 1
     mem: 2
     hrs: 4
+  concatenate_cross_cluster_comparison:
+    threads: 1
+    mem: 2
+    hrs: 1
   filter_and_pool_clusters:
     threads: 1
     mem: 2
