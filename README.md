@@ -198,8 +198,10 @@ plot_copy_number_vs_recurrence  (results/copy_number_vs_recurrence.png)
    flagged similar) — without this pre-pass, two such same-entry clusters
    could each independently get flagged against the same external winner
    and land in the same family without ever being compared to each other,
-   colliding on the RepeatMasker library's `{final_name}__{entry_id}`
-   header identity. A cluster consolidated away within its entry records
+   producing two disconnected, redundant rows in `summary_table.tsv` for
+   what's really one array (e.g. a monomer and its own dimer, tracked as
+   if independent) instead of one clean per-entry representative with
+   everything else folded into it. A cluster consolidated away within its entry records
    which sub-winner it was folded into via `within_entry_consolidated_into`
    (a separate, earlier provenance step from the global `is_representative`
    demotion) and inherits that sub-winner's eventual family. Ranking always
@@ -224,18 +226,20 @@ plot_copy_number_vs_recurrence  (results/copy_number_vs_recurrence.png)
    passes give a structurally exhaustive guarantee — there are exactly two
    ways a cluster can join a family (pre-pass within-entry consolidation,
    or a direct/global match against the family's representative), and both
-   are now deduplicated by `entry_id`, so no two same-entry clusters can
-   reach the final output claiming the same family, direct or indirect.
+   are now deduplicated by `entry_id`, so every entry that contributes to a
+   family has exactly one well-defined representative in the summary
+   table, direct or indirect convergence alike.
 
    Nothing is dropped from the summary table — every original cluster call
    still gets a row, non-representative members kept and marked
-   `is_representative=False`. The final RepeatMasker library is narrower:
-   it gets exactly one sequence per entry per family (that entry's own
-   sub-winner, win or lose globally), demoted to
-   `#Satellite/redundant_with_<final_name>` in the library's classification
-   field when it lost the global pass — a within-entry-consolidated
-   cluster doesn't get its own library entry, since it's redundant with its
-   own entry's sub-winner sequence by construction.
+   `is_representative=False`. Both passes' value is summary-table data
+   quality (one coherent per-entry representative per family, everything
+   else folded into it via `within_entry_consolidated_into`), not FASTA
+   correctness — the final RepeatMasker library is narrower still: **one
+   sequence per family**, just the global representative's own consensus
+   (see the results-files list below), so cross-entry/cross-method support
+   is recorded as metadata in the summary table rather than as duplicate
+   near-identical sequences in an annotation-ready library.
 10. **`plot_top_families`** reads the final summary table and produces one
     ranking bar chart per individual (that individual's own families, by the
     *max* `source_copy_number` across that individual's own entries — not a
@@ -462,11 +466,10 @@ Across entries:
   headers = `cluster_uid`
 - `results/cross_cluster_comparison.tsv` — pairwise similarity/multiple-of
   check across every pooled cluster
-- `results/repeatmasker_custom_lib.fasta` — **final output**: every
-  pooled cluster's consensus, headers as
-  `>{final_name}__{entry_id}#{classification}` (family representatives) or
-  `>{final_name}__{entry_id}#{classification}/redundant_with_{final_name}`
-  (other family members)
+- `results/repeatmasker_custom_lib.fasta` — **final output**: one record
+  per family (just its global representative's own consensus), headers as
+  `>{final_name}#{classification}`. Cross-entry/cross-method support lives
+  in `summary_table.tsv`, not as extra near-duplicate records here
 - `results/summary_table.tsv` — **final output**: one row per original
   cluster call, named/grouped into families with provenance — see the
   columns table below
@@ -490,12 +493,16 @@ specific candidate we found already known?" — and is much cheaper: ~100-250
 short sequences, well under a minute of actual RepeatMasker runtime
 regardless of library size, versus screening an entire genome.
 
-This step runs on `results/repeatmasker_custom_lib.fasta` (the final
-output — every cluster, winners and redundancy-demoted ones both, since a
-demoted cluster individually matching a known family is still useful
-information) and is wired into `rule all` alongside the other final
-outputs, consistent with this pipeline's fully-automatic design — there's
-no separate flag to opt in or out.
+This step runs on `results/repeatmasker_custom_lib.fasta` — one query per
+family, its global representative's own consensus — and is wired into
+`rule all` alongside the other final outputs, consistent with this
+pipeline's fully-automatic design — there's no separate flag to opt in or
+out. Redundant per-entry duplicates (see `within_entry_consolidated_into`
+in `summary_table.tsv`) are no longer screened independently, only their
+family's single representative is — since they're near-identical
+sequences by construction, this is very unlikely to change any real
+hit/no-hit outcome, and avoids screening several near-duplicate records
+for what's really one question ("is this family already known?").
 
 **Pipeline**: `prepare_known_repeat_query` (strips our own
 `#classification` suffix off each header, since it's not a valid
@@ -537,17 +544,17 @@ was contained to that directory, `rm -rf RM_*` in the repo root).
   real match wraps around the end of a single un-doubled copy. Same trick
   used internally elsewhere in this pipeline (`cross_motif_comparison.py`).
 
-**Reading `known_repeat_hits.tsv`**: every library entry (identified by its
-FASTA header up to the first `#`, i.e. `{final_name}__{entry_id}` — the
-same join key you'd reconstruct from `summary_table.tsv`'s `final_name` +
-`source_entry_id`) is present, but **this is not guaranteed to be one row
-per entry** — an entry with no hit gets exactly one row
+**Reading `known_repeat_hits.tsv`**: every family (identified by its FASTA
+header up to the first `#`, i.e. `final_name` directly — the same key
+`summary_table.tsv`'s `final_name` column already uses, no reconstruction
+needed) is present, but **this is not guaranteed to be one row per
+family** — a family with no hit gets exactly one row
 (`has_known_hit=False`, rest `NA`), a normal, common, and often *expected*
 outcome, not a failure (much of the satellite DNA in a non-model species
-genome is genuinely undescribed in existing databases); an entry with hits
+genome is genuinely undescribed in existing databases); a family with hits
 gets **one row per distinct matched repeat name**, so a motif that matches
 two unrelated known families shows up as two rows. If you need exactly one
-row per entry (e.g. for a simple join), sort by `reciprocal_overlap`
+row per family (e.g. for a simple join), sort by `reciprocal_overlap`
 descending and keep the first row per label. `repeat_name` /
 `repeat_class_family` identify each match, `sw_score` / `pct_divergence`
 describe its quality, and:
@@ -654,7 +661,7 @@ is what distinguishes the latter.
 
 | column | meaning |
 |---|---|
-| `final_name` | `SAT{motif_length}_{letter}` — the harmonized family name. Matches the FASTA header prefix in `repeatmasker_custom_lib.fasta` (`{final_name}__{source_entry_id}`) |
+| `final_name` | `SAT{motif_length}_{letter}` — the harmonized family name. Matches the FASTA header in `repeatmasker_custom_lib.fasta` (`>{final_name}#{classification}`, one record per family) |
 | `motif_length` | the family's representative cluster's own exact `consensus_length` (no rounding/averaging) |
 | `is_representative` | True for the single row per family with the highest `source_copy_number` overall — its consensus is what goes in the RepeatMasker library unqualified; every other row (globally demoted or within-entry-consolidated) is `False` |
 | `within_entry_consolidated_into` | `NA` if this row was its own entry's sub-winner (went into the global pass directly); otherwise the `source_cluster_label` of the sub-winner it was folded into within its own entry, before the global pass ran |

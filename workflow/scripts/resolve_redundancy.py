@@ -37,8 +37,10 @@ against already-confirmed GLOBAL winners, never against another candidate
 from its own entry. Two such same-entry clusters could therefore each
 independently get flagged against the same external winner and land in
 the same family without ever being compared to each other — producing two
-rows that collide on the {final_name}__{entry_id} library header identity
-downstream. The pre-pass fixes this at the source: within each entry,
+disconnected, redundant rows in --out-summary for what's really one array
+(e.g. a monomer and its own dimer, tracked as if independent) instead of
+one clean per-entry representative with everything else folded into it.
+The pre-pass fixes this at the source: within each entry,
 clusters are ranked and resolved into "sub-winners" first (one sub-winner
 per real family present in that entry); only sub-winners are fed into the
 unchanged global pass. Every cluster consolidated away within its entry is
@@ -71,9 +73,10 @@ number among everything in its own group. Together, the two passes give a
 structurally exhaustive guarantee: group_members[w] is the complete
 definition of family membership, and there are exactly two ways a cluster
 joins it (pre-pass within-entry consolidation, or direct/global match
-against w) — both are now deduplicated by entry_id, so no two same-entry
-clusters can reach the final output claiming the same family, direct or
-indirect.
+against w) — both are now deduplicated by entry_id, so every entry that
+contributes to a family has exactly one well-defined representative in
+--out-summary (via within_entry_consolidated_into), direct or indirect
+convergence alike.
 
 Naming: every newly-confirmed winner gets final_name = "SAT{motif_length}_
 {letter}", where motif_length is the WINNER'S OWN exact consensus_length
@@ -100,20 +103,23 @@ within_entry_consolidated_into records the (separate, earlier)
 within-entry fold, so a row can be within_entry_consolidated_into a
 sub-winner that itself later becomes globally is_representative=False.
 
---out-lib-fasta is narrower: it only ever gets one sequence per entry per
-family (the entry's own sub-winner, win or lose globally), since that's
-all the {final_name}__{entry_id} header format can uniquely address and a
-within-entry-consolidated cluster's sequence is, by construction, already
-redundant with its own entry's sub-winner. --out-summary is the complete
-record of where every original candidate ended up.
+--out-lib-fasta is narrower still: one sequence per FAMILY, full stop —
+just the global winner's own consensus, headers as
+>{final_name}#{classification}, no {entry_id} qualifier and no
+/redundant_with_ variant, since every record already *is* the
+representative by definition. Cross-entry/cross-method support for a
+family is metadata, not extra near-duplicate sequences in an
+annotation-ready library — that metadata lives entirely in --out-summary
+(entries_found, methods_found, within_entry_consolidated_into, etc.),
+which remains the complete record of where every original candidate
+ended up; nothing about that information is lost by --out-lib-fasta being
+narrower, only its duplication into the FASTA is removed.
 
 Outputs:
-  --out-lib-fasta: one sequence per entry per family (each entry's
-      sub-winner), headers as
-      >{final_name}__{entry_id}#{classification} for the global representative, and
-      >{final_name}__{entry_id}#{classification}/redundant_with_{final_name}
-      for every other entry's sub-winner in that family. Sorted
-      family-discovery-order, representative first within each family.
+  --out-lib-fasta: one record per family — >{final_name}#{classification}
+      followed by that family's global representative's own consensus.
+      Family-discovery order (i.e. descending total_copy_number among
+      winners).
   --out-summary: one row per original cluster call — the final harmonized
       master QC table.
 """
@@ -347,18 +353,21 @@ def main():
                     **prov,
                 })
 
-    # A family with two rows from the same entry_id would collide on the
-    # library FASTA's header ({final_name}__{entry_id}); fail loudly rather
-    # than invent an unverified disambiguation scheme for a case the spec's
-    # worked example never exercises. Scoped to within_entry_consolidated_into
-    # == "NA" (i.e. entry sub-winners, the only rows that actually produce a
-    # FASTA header) -- a within-entry-consolidated row deliberately shares
-    # (final_name, source_entry_id) with its own sub-winner, that's expected
-    # and not a collision. After the within-entry consolidation pre-pass
-    # this is expected to be unreachable in normal operation (two same-entry
-    # sub-winners can only both reach here if they were never flagged
-    # against each other) -- if it fires, that's a signal worth investigating
-    # on its own, not evidence this fix is incomplete.
+    # Internal consistency assertion, not a FASTA-header guard (the FASTA no
+    # longer keys on entry_id at all -- see the single-representative loop
+    # below): a family should never have two entry sub-winners from the same
+    # entry_id, since that would mean per-entry representative selection
+    # (and thus within_entry_consolidated_into) is ambiguous for that entry.
+    # Fail loudly rather than silently pick one. Scoped to
+    # within_entry_consolidated_into == "NA" (i.e. entry sub-winners) -- a
+    # within-entry-consolidated row deliberately shares (final_name,
+    # source_entry_id) with its own sub-winner, that's expected, not a
+    # violation. Both consolidation passes are specifically designed to make
+    # this unreachable in normal operation (two same-entry sub-winners can
+    # only both reach here if they were never flagged against each other AND
+    # never converged on a shared external winner) -- if it fires, that's a
+    # signal worth investigating on its own, not evidence either pass is
+    # incomplete.
     seen_header_keys = {}
     for row in rows_out:
         if row["within_entry_consolidated_into"] != "NA":
@@ -384,21 +393,14 @@ def main():
         for row in rows_out:
             out.write("\t".join(str(row[c]) for c in out_columns) + "\n")
 
-    # --- final RepeatMasker library ---
+    # --- final RepeatMasker library: one representative sequence per family ---
     with open(args.out_lib_fasta, "w") as out:
         for w in winners:
             final_name = final_name_of_winner[w]
-            for uid in group_members[w]:
-                c = by_uid[uid]
-                seq = seqs.get(uid, "")
-                if not seq:
-                    continue
-                header_name = f"{final_name}__{c['entry_id']}"
-                if uid == w:
-                    classification = args.classification
-                else:
-                    classification = f"{args.classification}/redundant_with_{final_name}"
-                out.write(f">{header_name}#{classification}\n{seq}\n")
+            seq = seqs.get(w, "")
+            if not seq:
+                continue
+            out.write(f">{final_name}#{args.classification}\n{seq}\n")
 
     n_redundant = sum(1 for r in rows_out if not r["is_representative"])
     sys.stderr.write(
