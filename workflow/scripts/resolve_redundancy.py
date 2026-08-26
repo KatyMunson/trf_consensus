@@ -26,6 +26,30 @@ similar to or a multiple of an existing winner, it joins that winner's
 family; otherwise it becomes a new winner (and the representative of a new
 family) itself. Same non-chained pattern as before.
 
+TWO-LEVEL RESOLUTION — a within-entry consolidation pre-pass runs before
+the global pass described above, using the exact same non-chained
+algorithm (see resolve_winners()), just scoped to one entry's own clusters
+at a time. This exists because one entry's TRF period scan can nominate
+several candidate bins for the same real monomer (e.g. periods 411/417/423
+all mutually flagged similar — jitter that survived nms_radius
+suppression), and the global pass alone only ever compares each cluster
+against already-confirmed GLOBAL winners, never against another candidate
+from its own entry. Two such same-entry clusters could therefore each
+independently get flagged against the same external winner and land in
+the same family without ever being compared to each other — producing two
+rows that collide on the {final_name}__{entry_id} library header identity
+downstream. The pre-pass fixes this at the source: within each entry,
+clusters are ranked and resolved into "sub-winners" first (one sub-winner
+per real family present in that entry); only sub-winners are fed into the
+unchanged global pass. Every cluster consolidated away within its entry is
+still kept in the final outputs (is_representative=False, same as any
+other non-representative row) and records which sub-winner it was folded
+into via within_entry_consolidated_into (NA for sub-winners themselves).
+A sub-winner's total_copy_number is used as-is for global-pass ranking —
+deliberately NOT summed across what it consolidated, since overlapping
+bin extraction windows (period +/- window) mean the same raw TRF loci
+could plausibly have been double-counted into more than one bin already.
+
 Naming: every newly-confirmed winner gets final_name = "SAT{motif_length}_
 {letter}", where motif_length is the WINNER'S OWN exact consensus_length
 (no rounding/averaging — different entries can legitimately disagree by a
@@ -42,17 +66,29 @@ walking entries_found in that same sorted order and deduping each entry's
 individual/method while preserving first-occurrence order (not an
 alphabetical sort of the values themselves).
 
-Nothing is dropped — every original cluster call still appears in the
-final outputs, but non-representative members of a family are marked
-is_representative=False and demoted in the RepeatMasker library's
-classification field, rather than removed.
+Nothing is dropped from --out-summary — every original cluster call still
+appears there, but non-representative members of a family are marked
+is_representative=False, rather than removed. within_entry_consolidated_into
+gives that demotion a second, finer-grained provenance dimension:
+is_representative/final_name describe global, cross-entry demotion, while
+within_entry_consolidated_into records the (separate, earlier)
+within-entry fold, so a row can be within_entry_consolidated_into a
+sub-winner that itself later becomes globally is_representative=False.
+
+--out-lib-fasta is narrower: it only ever gets one sequence per entry per
+family (the entry's own sub-winner, win or lose globally), since that's
+all the {final_name}__{entry_id} header format can uniquely address and a
+within-entry-consolidated cluster's sequence is, by construction, already
+redundant with its own entry's sub-winner. --out-summary is the complete
+record of where every original candidate ended up.
 
 Outputs:
-  --out-lib-fasta: EVERY cluster's consensus, headers as
-      >{final_name}__{entry_id}#{classification} for the representative, and
+  --out-lib-fasta: one sequence per entry per family (each entry's
+      sub-winner), headers as
+      >{final_name}__{entry_id}#{classification} for the global representative, and
       >{final_name}__{entry_id}#{classification}/redundant_with_{final_name}
-      for other family members. Sorted family-discovery-order, representative
-      first within each family.
+      for every other entry's sub-winner in that family. Sorted
+      family-discovery-order, representative first within each family.
   --out-summary: one row per original cluster call — the final harmonized
       master QC table.
 """
@@ -101,6 +137,33 @@ def letter_for_index(n):
     return s
 
 
+def resolve_winners(candidate_uids, flagged, by_uid):
+    """Rank candidate_uids by total_copy_number descending; each is checked
+    only against already-confirmed winners from THIS SAME candidate_uids
+    pool — never against a loser, never chained through an intermediate,
+    and never against a cluster outside candidate_uids (this is what scopes
+    one call to a single entry vs. globally: `winners` is only ever
+    populated from what's passed in, so a match can never reach outside the
+    pool). Returns (winners, group_members, redundant_with):
+      winners        -- winner cluster_uids, in discovery order
+      group_members  -- winner cluster_uid -> [winner, loser, loser, ...]
+      redundant_with -- loser cluster_uid -> the winner it joined
+    """
+    ranked = sorted(candidate_uids, key=lambda u: float(by_uid[u]["total_copy_number"]), reverse=True)
+    winners = []
+    redundant_with = {}
+    group_members = defaultdict(list)
+    for uid in ranked:
+        match = next((w for w in winners if w in flagged[uid]), None)
+        if match is None:
+            winners.append(uid)
+            group_members[uid].append(uid)
+        else:
+            redundant_with[uid] = match
+            group_members[match].append(uid)
+    return winners, group_members, redundant_with
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--clusters-tsv", required=True, help="filtered_pooled_clusters.tsv")
@@ -116,8 +179,8 @@ def main():
     seqs = read_multi_fasta(args.consensus_fasta)
 
     out_columns = [
-        "final_name", "motif_length", "is_representative", "source_entry_id",
-        "source_cluster_label", "source_individual", "source_assembly_method",
+        "final_name", "motif_length", "is_representative", "within_entry_consolidated_into",
+        "source_entry_id", "source_cluster_label", "source_individual", "source_assembly_method",
         "source_phasing_status", "source_copy_number", "source_consensus_length",
         "source_gc_content", "n_entries_found", "entries_found", "n_individuals_present",
         "individuals_found", "n_methods_confirming", "methods_found",
@@ -146,25 +209,26 @@ def main():
                 flagged[b].add(a)
                 n_edges += 1
 
-    ranked = sorted(clusters, key=lambda c: float(c["total_copy_number"]), reverse=True)
+    # --- within-entry consolidation pre-pass: same non-chained algorithm,
+    # scoped to one entry's own clusters at a time, so two same-entry
+    # clusters that both independently match the same external winner get
+    # compared to EACH OTHER first, before either ever reaches the global
+    # pass (see module docstring's "TWO-LEVEL RESOLUTION" section). ---
+    all_subwinners = []                     # every entry's sub-winners, flattened
+    entry_group_members = {}                # sub-winner uid -> [sub-winner, consolidated, ...]
+    entry_ids = sorted({c["entry_id"] for c in clusters})
+    for entry_id in entry_ids:
+        entry_uids = [c["cluster_uid"] for c in clusters if c["entry_id"] == entry_id]
+        sub_winners, sub_group_members, _ = resolve_winners(entry_uids, flagged, by_uid)
+        all_subwinners.extend(sub_winners)
+        entry_group_members.update(sub_group_members)
 
-    winners = []                       # winner cluster_uids, in discovery order
-    redundant_with = {}                # loser cluster_uid -> winner cluster_uid
-    group_members = defaultdict(list)  # winner cluster_uid -> [winner, loser, loser, ...]
+    n_within_entry_consolidated = sum(len(members) - 1 for members in entry_group_members.values())
 
-    for c in ranked:
-        uid = c["cluster_uid"]
-        match = None
-        for w in winners:
-            if w in flagged[uid]:
-                match = w
-                break  # winners is already support-sorted; first hit is the strongest
-        if match is None:
-            winners.append(uid)
-            group_members[uid].append(uid)
-        else:
-            redundant_with[uid] = match
-            group_members[match].append(uid)
+    # --- global pass: unchanged algorithm, now run over sub-winners only.
+    # Each sub-winner's total_copy_number is used as-is (not summed across
+    # what it consolidated) -- see module docstring. ---
+    winners, group_members, redundant_with = resolve_winners(all_subwinners, flagged, by_uid)
 
     # --- naming: one final_name per winner, letters disambiguate shared motif_length ---
     letter_counter = defaultdict(int)
@@ -198,32 +262,51 @@ def main():
             "n_methods_confirming": len(methods_found), "methods_found": ";".join(methods_found),
         }
 
-    # --- final summary table, family-discovery order, representative first within each family ---
+    # --- final summary table, family-discovery order, representative first
+    # within each family. Each winner's group_members[w] holds sub-winner
+    # uids (at most one per contributing entry); expand each sub-winner
+    # back out to every cluster within-entry-consolidated into it, so every
+    # original cluster call still gets exactly one row (nothing dropped). ---
     rows_out = []
     for w in winners:
         final_name = final_name_of_winner[w]
         motif_length = int(by_uid[w]["consensus_length"])
         prov = provenance[w]
-        for uid in group_members[w]:
-            c = by_uid[uid]
-            rows_out.append({
-                "final_name": final_name, "motif_length": motif_length,
-                "is_representative": uid == w,
-                "source_entry_id": c["entry_id"], "source_cluster_label": c["source_cluster_label"],
-                "source_individual": c["individual"], "source_assembly_method": c["assembly_method"],
-                "source_phasing_status": c["phasing_status"],
-                "source_copy_number": c["total_copy_number"],
-                "source_consensus_length": c["consensus_length"],
-                "source_gc_content": c["gc_content"],
-                **prov,
-            })
+        for sub_uid in group_members[w]:
+            for uid in entry_group_members[sub_uid]:
+                c = by_uid[uid]
+                within_entry_consolidated_into = (
+                    "NA" if uid == sub_uid else by_uid[sub_uid]["source_cluster_label"]
+                )
+                rows_out.append({
+                    "final_name": final_name, "motif_length": motif_length,
+                    "is_representative": uid == w,
+                    "within_entry_consolidated_into": within_entry_consolidated_into,
+                    "source_entry_id": c["entry_id"], "source_cluster_label": c["source_cluster_label"],
+                    "source_individual": c["individual"], "source_assembly_method": c["assembly_method"],
+                    "source_phasing_status": c["phasing_status"],
+                    "source_copy_number": c["total_copy_number"],
+                    "source_consensus_length": c["consensus_length"],
+                    "source_gc_content": c["gc_content"],
+                    **prov,
+                })
 
     # A family with two rows from the same entry_id would collide on the
     # library FASTA's header ({final_name}__{entry_id}); fail loudly rather
     # than invent an unverified disambiguation scheme for a case the spec's
-    # worked example never exercises.
+    # worked example never exercises. Scoped to within_entry_consolidated_into
+    # == "NA" (i.e. entry sub-winners, the only rows that actually produce a
+    # FASTA header) -- a within-entry-consolidated row deliberately shares
+    # (final_name, source_entry_id) with its own sub-winner, that's expected
+    # and not a collision. After the within-entry consolidation pre-pass
+    # this is expected to be unreachable in normal operation (two same-entry
+    # sub-winners can only both reach here if they were never flagged
+    # against each other) -- if it fires, that's a signal worth investigating
+    # on its own, not evidence this fix is incomplete.
     seen_header_keys = set()
     for row in rows_out:
+        if row["within_entry_consolidated_into"] != "NA":
+            continue
         key = (row["final_name"], row["source_entry_id"])
         if key in seen_header_keys:
             sys.exit(
@@ -258,7 +341,9 @@ def main():
     n_redundant = sum(1 for r in rows_out if not r["is_representative"])
     sys.stderr.write(
         f"[resolve_redundancy] {len(clusters)} clusters, {n_edges} flagged relationships, "
-        f"{len(winners)} families, {n_redundant} non-representative members\n"
+        f"{n_within_entry_consolidated} consolidated within-entry ({len(all_subwinners)} entry "
+        f"sub-winners fed to the global pass), {len(winners)} families, "
+        f"{n_redundant} non-representative members\n"
     )
 
 

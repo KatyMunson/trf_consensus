@@ -186,12 +186,36 @@ plot_copy_number_vs_recurrence  (results/copy_number_vs_recurrence.png)
    different entries' independent MSAs can legitimately disagree by a base
    or two) and `letter` disambiguates families that happen to share a
    motif_length, assigned in discovery order. Every row is annotated with
-   which entries/individuals/methods its family was found in. Nothing is
-   dropped — non-representative members are kept in both the summary table
-   (`is_representative=False`) and the final RepeatMasker library, demoted
-   to `#Satellite/redundant_with_<final_name>` in the library's
-   classification field, so they're still visible (and RepeatMasker-usable)
-   but clearly lower priority.
+   which entries/individuals/methods its family was found in.
+
+   **Same-entry consolidation pre-pass**: before that global pass runs, the
+   exact same non-chained algorithm runs once per entry, scoped to that
+   entry's own clusters only, resolving them down to one "sub-winner" per
+   real family present in that entry — only sub-winners are fed into the
+   global pass. This exists because a single entry's TRF period scan can
+   nominate several candidate bins for the same real monomer (period jitter
+   surviving `nms_radius` suppression, e.g. periods 411/417/423 all mutually
+   flagged similar) — without this pre-pass, two such same-entry clusters
+   could each independently get flagged against the same external winner
+   and land in the same family without ever being compared to each other,
+   colliding on the RepeatMasker library's `{final_name}__{entry_id}`
+   header identity. A cluster consolidated away within its entry records
+   which sub-winner it was folded into via `within_entry_consolidated_into`
+   (a separate, earlier provenance step from the global `is_representative`
+   demotion) and inherits that sub-winner's eventual family. Ranking always
+   uses a sub-winner's own `total_copy_number` as-is, never summed across
+   what it consolidated — bin extraction windows (`period ± window`) can
+   overlap, so summing risks double-counting the same raw TRF loci.
+
+   Nothing is dropped from the summary table — every original cluster call
+   still gets a row, non-representative members kept and marked
+   `is_representative=False`. The final RepeatMasker library is narrower:
+   it gets exactly one sequence per entry per family (that entry's own
+   sub-winner, win or lose globally), demoted to
+   `#Satellite/redundant_with_<final_name>` in the library's classification
+   field when it lost the global pass — a within-entry-consolidated
+   cluster doesn't get its own library entry, since it's redundant with its
+   own entry's sub-winner sequence by construction.
 10. **`plot_top_families`** reads the final summary table and produces one
     ranking bar chart per individual (that individual's own families, by the
     *max* `source_copy_number` across that individual's own entries — not a
@@ -600,16 +624,23 @@ informative if the library actually had something to compare against.
 ## `results/summary_table.tsv` columns
 
 One row per original cluster call — nothing dropped, non-representative
-family members are kept and marked `is_representative=False`.
+family members are kept and marked `is_representative=False`. Note that
+`is_representative=False` covers two distinct demotions now (see "Pipeline"
+step 9's same-entry consolidation pre-pass): a row can be demoted globally
+(lost the cross-entry pass to some other entry's stronger cluster) and/or
+consolidated within its own entry first (folded into that entry's own
+sub-winner before the global pass ever ran) — `within_entry_consolidated_into`
+is what distinguishes the latter.
 
 | column | meaning |
 |---|---|
 | `final_name` | `SAT{motif_length}_{letter}` — the harmonized family name. Matches the FASTA header prefix in `repeatmasker_custom_lib.fasta` (`{final_name}__{source_entry_id}`) |
 | `motif_length` | the family's representative cluster's own exact `consensus_length` (no rounding/averaging) |
-| `is_representative` | True for the one row per family with the highest `source_copy_number` — its consensus is what goes in the RepeatMasker library unqualified; other rows are `#Satellite/redundant_with_{final_name}` |
+| `is_representative` | True for the single row per family with the highest `source_copy_number` overall — its consensus is what goes in the RepeatMasker library unqualified; every other row (globally demoted or within-entry-consolidated) is `False` |
+| `within_entry_consolidated_into` | `NA` if this row was its own entry's sub-winner (went into the global pass directly); otherwise the `source_cluster_label` of the sub-winner it was folded into within its own entry, before the global pass ran |
 | `source_entry_id` / `source_individual` / `source_assembly_method` / `source_phasing_status` | which manifest entry this specific cluster call came from |
 | `source_cluster_label` | that entry's own cluster label (`{motif}_rank{rank}_n{N}`), before pooling |
-| `source_copy_number` | this cluster's own `total_copy_number` (summed raw TRF copy number, not locus count) — the ranking key resolve_redundancy used |
+| `source_copy_number` | this cluster's own `total_copy_number` (summed raw TRF copy number, not locus count) — the ranking key resolve_redundancy used at both the within-entry and global level (never summed across consolidated duplicates) |
 | `source_consensus_length` / `source_gc_content` | of this specific cluster's own consensus (can differ slightly from `motif_length` — see "Pipeline" step 9) |
 | `n_entries_found` / `entries_found` | how many / which manifest entries this family was found in at all |
 | `n_individuals_present` / `individuals_found` | how many / which individuals this family was found in |
