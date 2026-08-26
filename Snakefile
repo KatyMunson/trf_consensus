@@ -870,10 +870,16 @@ rule evaluate_satellite_coverage:
     envmodules:
         "python/3.11"
     shell:
+        # --hits-family-filter restricts coverage counting to hits whose family
+        # matches our own library's classification -- RepeatMasker's built-in
+        # low-complexity/simple-repeat calls (independent of -lib, present in
+        # every run) would otherwise inflate recall. lib_hits.bed itself stays
+        # unfiltered (see rm_lib_hits_to_bed) for manual inspection.
         "python workflow/scripts/evaluate_satellite_coverage.py "
         "--likely-bed {input.likely} --hits-bed {input.hits} "
         "--sample {wildcards.sample} "
         "--min-coverage-fraction {params.min_coverage_fraction} "
+        "--hits-family-filter {config[repeatmasker_classification]} "
         "--out-summary {output.summary} --out-missing {output.missing} "
         "--out-regions {output.regions} > {log} 2>&1"
 

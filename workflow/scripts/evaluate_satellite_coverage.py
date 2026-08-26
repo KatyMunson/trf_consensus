@@ -6,18 +6,32 @@ hits. A region counts as "covered" if its overlap fraction >=
 per-region covered/not-covered breakdown and the missing-regions list --
 the overall bp recall in coverage_summary.tsv sums actual overlapping bp
 across all regions regardless of the per-region threshold).
+
+--hits-family-filter (optional): RepeatMasker always runs its own built-in
+low-complexity/simple-repeat pass regardless of the supplied -lib library
+(e.g. "(AACCCT)n#Simple_repeat", "A-rich#Low_complexity") -- these are not
+matches against our discovered library. hits-bed (rm_out_to_bed.py's output)
+is deliberately left unfiltered so those regions stay visible for manual
+inspection, so this script does the filtering instead: when set, only
+hits-bed rows whose name#family column has a family (the part after the
+last "#") exactly equal to this value count toward coverage. Matches
+config["repeatmasker_classification"], the same value used to build
+repeatmasker_custom_lib.fasta's own headers.
 """
 import argparse
 from collections import defaultdict
 
 
-def read_bed(path):
+def read_bed(path, family_filter=None):
     by_seq = defaultdict(list)
     with open(path) as f:
         for line in f:
             fields = line.rstrip("\n").split("\t")
             if len(fields) < 3:
                 continue
+            if family_filter is not None:
+                if len(fields) < 4 or fields[3].rsplit("#", 1)[-1] != family_filter:
+                    continue
             by_seq[fields[0]].append((int(fields[1]), int(fields[2])))
     for seq in by_seq:
         by_seq[seq].sort()
@@ -44,13 +58,18 @@ def main():
     ap.add_argument("--hits-bed", required=True)
     ap.add_argument("--sample", required=True)
     ap.add_argument("--min-coverage-fraction", type=float, required=True)
+    ap.add_argument("--hits-family-filter", default=None,
+                     help="Only count hits-bed rows whose name#family column's family "
+                          "exactly equals this value (see module docstring). Omit to "
+                          "count every hits-bed row, including RepeatMasker's own "
+                          "built-in low-complexity/simple-repeat calls.")
     ap.add_argument("--out-summary", required=True)
     ap.add_argument("--out-missing", required=True)
     ap.add_argument("--out-regions", required=True)
     args = ap.parse_args()
 
     likely = read_bed(args.likely_bed)
-    hits = read_bed(args.hits_bed)
+    hits = read_bed(args.hits_bed, family_filter=args.hits_family_filter)
 
     total_bp = covered_bp = n_regions = n_covered_regions = 0
 

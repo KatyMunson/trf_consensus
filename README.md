@@ -684,6 +684,20 @@ Config knobs (`satellite_screen` block in `config.yaml`):
   reported in `coverage_summary.tsv`, which sums actual overlapping bp
   across all regions regardless of this threshold.
 
+**`lib_hits.bed` includes RepeatMasker's own built-in low-complexity/simple-repeat
+calls, not just custom-library hits.** RepeatMasker always runs an internal
+low-complexity/simple-repeat detection pass (`(AACCCT)n#Simple_repeat`,
+`A-rich#Low_complexity`, etc.) regardless of the `-lib` library supplied —
+these are independent of, and unrelated to, whether `repeatmasker_custom_lib.fasta`
+matched anything. `rm_lib_hits_to_bed`'s output is deliberately left
+unfiltered so these regions stay visible for manual inspection, but they do
+**not** count toward coverage: `evaluate_satellite_coverage` is called with
+`--hits-family-filter {repeatmasker_classification}`, so only hits whose
+family exactly matches the library's own classification (the same value used
+to build `repeatmasker_custom_lib.fasta`'s headers) are counted. If you're
+reading `lib_hits.bed` directly, don't assume every row there contributed to
+the coverage numbers in `coverage_summary.tsv`.
+
 Outputs (`results/genome_satellite_screen/`):
 - `overall_coverage_summary.tsv` — one row per sample plus an `ALL` row:
   total likely-satellite bp, covered bp, overall bp recall, region counts,
@@ -691,7 +705,9 @@ Outputs (`results/genome_satellite_screen/`):
 - `overall_coverage_histogram.png` — genome-wide histogram of
   likely-satellite region sizes, split by covered vs. not covered.
 - Per-sample `{sample}/coverage_summary.tsv`, `{sample}/missing_regions.tsv`,
-  `{sample}/regions_with_coverage.tsv`.
+  `{sample}/regions_with_coverage.tsv` (computed from `lib_hits.bed` filtered
+  to the library's own classification, see above), and `{sample}/lib_hits.bed`
+  itself (unfiltered).
 - `satellite_arrays_manifest.tsv` — `# sample  rm_out  assembly_fasta`,
   one row per sample/haplotype, with absolute paths. This can be copied in
   directly as the `satellite_arrays` pipeline's own `manifest.tsv` (see that
