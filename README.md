@@ -30,6 +30,7 @@ build_all_clusters_table  +  combine_cluster_fastas
         |
         v  (once every entry has finished the above)
 plot_copy_number_diagnostic  (results/copy_number_diagnostic.png)
+plot_copy_number_qc_diagnostic  (results/copy_number_qc_scatter.png)
         |
         v
 filter_and_pool_clusters  (drop below min_total_copy_number, pool across entries)
@@ -45,6 +46,7 @@ results/repeatmasker_custom_lib.fasta + results/summary_table.tsv
         |
         v
 plot_top_families  (per-individual + global ranking plots)
+plot_copy_number_vs_recurrence  (results/copy_number_vs_recurrence.png)
 ```
 
 1. **`scan_dat_candidates`** scans one entry's whole `.dat` file(s) directly
@@ -71,7 +73,10 @@ plot_top_families  (per-individual + global ranking plots)
    alignment and majority-rule consensus, plus a summed `total_copy_number`
    (raw TRF `copy_number`, not locus count) across every locus that joined
    it — the per-entry support metric everything downstream ranks and filters
-   on. **Sequences that never join a cluster of the minimum size are
+   on — and copy-number-weighted `mean_percent_match` / `mean_entropy`
+   (TRF's own per-locus quality fields) across those same loci, feeding
+   step 6's QC cross-reference diagnostic. **Sequences that never join a
+   cluster of the minimum size are
    dropped, not reported** — this pipeline is tuned for finding high-signal
    candidates (centromeric/large satellite arrays), not for characterizing
    background noise.
@@ -95,13 +100,29 @@ plot_top_families  (per-individual + global ranking plots)
    `min_total_copy_number`, so you can eyeball whether the threshold
    actually sits in a gap between background noise and real signal before
    committing to a rerun.
-6. **`filter_and_pool_clusters`** drops each entry's clusters below
+6. **`plot_copy_number_qc_diagnostic`** runs alongside step 5 (same
+   pre-filter input timing), because the plain histogram alone can't
+   always resolve an ambiguous noise/signal boundary — a real run might
+   show a noisy plateau with no clean valley rather than the two-population
+   split the histogram assumes. Cross-references the same
+   `total_copy_number` against `target_period` and two of TRF's own
+   per-locus quality fields aggregated per cluster
+   (`mean_percent_match`, `mean_entropy`, both **copy-number-weighted**
+   across the cluster's raw loci — a locus that itself represents a large
+   array counts proportionally more toward the cluster's average quality
+   than a low-copy-number one), colored by whether each cluster currently
+   passes the threshold. Look for red (filtered) points sitting high on
+   percent-match/entropy — candidates possibly excluded for a reason other
+   than being noise (e.g. an array fragmented across assembly gaps) — and
+   blue (passing) points sitting low on those axes, which look questionable
+   on every other available signal.
+7. **`filter_and_pool_clusters`** drops each entry's clusters below
    `min_total_copy_number`, then pools every surviving cluster from every
    entry into one table and one FASTA. Clusters are renamed
    `cluster_uid = {entry_id}__{source_cluster_label}` so labels that
    collide across entries (e.g. two entries both producing a
    `cand171_rank1_n...` label) stay distinct once pooled.
-7. **`cross_cluster_comparison`** compares every pooled cluster found — all
+8. **`cross_cluster_comparison`** compares every pooled cluster found — all
    entries, all bins, all ranks, including different ranks within the same
    bin — using
    **coverage-aware tiling with a randomization significance test**, not a
@@ -125,7 +146,7 @@ plot_top_families  (per-individual + global ranking plots)
    otherwise inflate the false-positive rate beyond what the raw identity
    threshold implies, especially for short or compositionally simple
    sequences.
-8. **`resolve_redundancy`** processes pooled clusters in descending
+9. **`resolve_redundancy`** processes pooled clusters in descending
    `total_copy_number` order (not `n_input_sequences` — copy number is the
    fair cross-entry/cross-method support metric now that pooling is
    involved). Each cluster is checked only against clusters **already
@@ -149,14 +170,25 @@ plot_top_families  (per-individual + global ranking plots)
    to `#Satellite/redundant_with_<final_name>` in the library's
    classification field, so they're still visible (and RepeatMasker-usable)
    but clearly lower priority.
-9. **`plot_top_families`** reads the final summary table and produces one
-   ranking bar chart per individual (that individual's own families, by the
-   *max* `source_copy_number` across that individual's own entries — not a
-   sum, to avoid conflating two methods' independent measurements of the
-   same underlying quantity) plus one global chart across all
-   individuals/entries. Bars are colored by whether the family was found in
-   more than one individual, as a visual cross-check against
-   `n_individuals_present`.
+10. **`plot_top_families`** reads the final summary table and produces one
+    ranking bar chart per individual (that individual's own families, by the
+    *max* `source_copy_number` across that individual's own entries — not a
+    sum, to avoid conflating two methods' independent measurements of the
+    same underlying quantity) plus one global chart across all
+    individuals/entries. Bars are colored by whether the family was found in
+    more than one individual, as a visual cross-check against
+    `n_individuals_present`.
+11. **`plot_copy_number_vs_recurrence`** runs after step 9, one point per
+    family (the representative's own `total_copy_number`) against how many
+    entries and how many methods independently confirmed it
+    (`n_entries_found` / `n_methods_confirming`, as two side-by-side panels
+    since they can tell different stories — e.g. a family found in several
+    entries but only one method is a weaker claim than one confirmed by two
+    different methods). Cross-entry recurrence is confirmation a
+    single-entry copy-number threshold can't see at all; this view is what
+    makes a *more permissive* `min_total_copy_number` combined with a good
+    recurrence signal a defensible choice, rather than asking one static
+    threshold to do all the noise/signal separation alone.
 
 ## Sanity-checking a mega-group
 
@@ -227,7 +259,8 @@ setup), but a few deliberately have no `envmodules:` fallback:
 `run_repeatmasker_known_screen` (it installs its own fresh, pipeline-owned
 RepeatMasker via conda rather than reusing whatever's already on the
 cluster — see "Known-repeat screening" below), and
-`plot_copy_number_diagnostic`/`plot_top_families` (matplotlib isn't
+`plot_copy_number_diagnostic`/`plot_copy_number_qc_diagnostic`/
+`plot_top_families`/`plot_copy_number_vs_recurrence` (matplotlib isn't
 assumed to have a cluster module, so they're conda-only). Passing both
 flags lets Snakemake use envmodules wherever a rule defines them and fall
 back to conda for the rest; passing `--use-envmodules` alone would run
@@ -236,8 +269,9 @@ those rules with no environment management at all.
 (Swap `--use-envmodules` for `--use-conda` to run off the per-rule envs in
 `workflow/envs/` instead: `python_base.yaml` for pure-Python rules,
 `edlib.yaml` for `cross_cluster_comparison`, `cluster_rank.yaml` [edlib + mafft together] for `rank_family_clusters`,
-`plotting.yaml` [matplotlib] for `plot_copy_number_diagnostic`/
-`plot_top_families`.)
+`plotting.yaml` [matplotlib] for the four plotting rules
+(`plot_copy_number_diagnostic`, `plot_copy_number_qc_diagnostic`,
+`plot_top_families`, `plot_copy_number_vs_recurrence`).)
 
 Because `scan_dat_candidates` is a checkpoint, the first `snakemake -n`
 dry-run will report "the run involves checkpoint jobs, which will result in
@@ -294,7 +328,18 @@ per-entry cluster filter applied in `filter_and_pool_clusters`, before
 cross-entry pooling. Check `results/copy_number_diagnostic.png` (a
 log-scaled histogram of every entry's pre-filter `total_copy_number`
 values with this threshold marked) to confirm it sits in a real gap
-between background noise and true arrays before trusting a run.
+between background noise and true arrays before trusting a run — and if
+the histogram alone doesn't show a clean gap (a real, not hypothetical,
+failure mode: a noisy plateau with no clear valley), cross-check against
+`results/copy_number_qc_scatter.png` (copy number vs. period length /
+percent-match / entropy) and, after a run completes,
+`results/copy_number_vs_recurrence.png` (copy number vs. how many
+entries/methods independently confirmed each family) before deciding the
+threshold is placed well. A middling-copy-number family confirmed across
+several entries/methods is stronger evidence than an equally-scored family
+found only once — recurrence a single static per-entry threshold can't
+see on its own, and a reason a more permissive threshold can be a
+defensible choice once you're leaning on that cross-check too.
 
 **`visualization`** — `top_n_families` (default 20) controls how many bars
 `plot_top_families` draws per individual and in the global ranking plot.
@@ -315,7 +360,9 @@ Per-entry (namespaced under `results/{entry_id}/...`):
 - `results/{entry_id}/{motif}/ranked_clusters/rank01_n<N>.fasta`,
   `rank02_...`, etc. — one consensus per cluster found in that bin
 - `results/{entry_id}/{motif}/ranked_clusters_summary.tsv` — per-bin
-  cluster ranking, including `total_copy_number`
+  cluster ranking, including `total_copy_number` and the
+  copy-number-weighted `mean_percent_match` / `mean_entropy` (TRF's own
+  per-locus quality fields, averaged across the cluster's raw loci)
 - `results/{entry_id}/all_clusters.tsv` — every cluster from every bin of
   this entry, one master table
 - `results/{entry_id}/all_clusters_consensus.fasta` — every cluster's
@@ -325,6 +372,10 @@ Across entries:
 - `results/copy_number_diagnostic.png` — pre-filter `total_copy_number`
   distribution across every entry, with the `min_total_copy_number`
   threshold marked
+- `results/copy_number_qc_scatter.png` — the same pre-filter clusters,
+  `total_copy_number` (log x-axis, colored by pass/fail) vs. `target_period`
+  / `mean_percent_match` / `mean_entropy`, for when the histogram alone
+  doesn't show a clean noise/signal gap
 - `results/filtered_pooled_clusters.tsv` — every entry's surviving clusters
   (post-filter), pooled, `cluster_uid = {entry_id}__{source_cluster_label}`
 - `results/pooled_consensus.fasta` — every surviving cluster's consensus,
@@ -343,7 +394,10 @@ Across entries:
   joined against a Dfam/RepBase known-repeat screen, see "Known-repeat
   screening" below
 - `results/top_families_{individual}.png`, `results/top_families_global.png`
-  — **final output**: family-ranking bar charts, see "Pipeline" step 9
+  — **final output**: family-ranking bar charts, see "Pipeline" step 10
+- `results/copy_number_vs_recurrence.png` — **final output**: one point per
+  family, representative `total_copy_number` vs. `n_entries_found` /
+  `n_methods_confirming`, see "Pipeline" step 11
 
 ## Known-repeat screening
 
@@ -520,7 +574,7 @@ family members are kept and marked `is_representative=False`.
 | `source_entry_id` / `source_individual` / `source_assembly_method` / `source_phasing_status` | which manifest entry this specific cluster call came from |
 | `source_cluster_label` | that entry's own cluster label (`{motif}_rank{rank}_n{N}`), before pooling |
 | `source_copy_number` | this cluster's own `total_copy_number` (summed raw TRF copy number, not locus count) — the ranking key resolve_redundancy used |
-| `source_consensus_length` / `source_gc_content` | of this specific cluster's own consensus (can differ slightly from `motif_length` — see "Pipeline" step 8) |
+| `source_consensus_length` / `source_gc_content` | of this specific cluster's own consensus (can differ slightly from `motif_length` — see "Pipeline" step 9) |
 | `n_entries_found` / `entries_found` | how many / which manifest entries this family was found in at all |
 | `n_individuals_present` / `individuals_found` | how many / which individuals this family was found in |
 | `n_methods_confirming` / `methods_found` | how many / which assembly methods this family was found in |

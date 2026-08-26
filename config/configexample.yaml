@@ -147,11 +147,19 @@ resources:
     threads: 1
     mem: 2
     hrs: 1
+  plot_copy_number_qc_diagnostic:
+    threads: 1
+    mem: 2
+    hrs: 1
   resolve_redundancy:
     threads: 1
     mem: 2
     hrs: 1
   plot_top_families:
+    threads: 1
+    mem: 2
+    hrs: 1
+  plot_copy_number_vs_recurrence:
     threads: 1
     mem: 2
     hrs: 1

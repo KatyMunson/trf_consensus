@@ -184,6 +184,8 @@ rule all:
         "results/summary_table.tsv",
         "results/known_repeat_hits.tsv",
         "results/copy_number_diagnostic.png",
+        "results/copy_number_qc_scatter.png",
+        "results/copy_number_vs_recurrence.png",
         "results/top_families_global.png",
         expand("results/top_families_{individual}.png", individual=INDIVIDUALS)
 
@@ -362,6 +364,31 @@ rule plot_copy_number_diagnostic:
         "--out-png {output} > {log} 2>&1"
 
 
+rule plot_copy_number_qc_diagnostic:
+    # Same input timing as plot_copy_number_diagnostic (every entry's
+    # pre-filter all_clusters.tsv) but cross-references total_copy_number
+    # against target_period and TRF's own per-locus quality fields
+    # (mean_percent_match, mean_entropy), since the plain histogram alone
+    # can't resolve an ambiguous noise/signal middle on its own.
+    input:
+        clusters_tsv=expand("results/{entry_id}/all_clusters.tsv", entry_id=ENTRY_IDS)
+    output:
+        "results/copy_number_qc_scatter.png"
+    log:
+        "results/logs/plot_copy_number_qc_diagnostic.log"
+    threads: config["resources"]["plot_copy_number_qc_diagnostic"]["threads"]
+    resources:
+        mem=lambda wildcards, attempt: config["resources"]["plot_copy_number_qc_diagnostic"]["mem"] * attempt,
+        hrs=config["resources"]["plot_copy_number_qc_diagnostic"]["hrs"]
+    conda:
+        "workflow/envs/plotting.yaml"
+    shell:
+        "python workflow/scripts/plot_copy_number_qc_diagnostic.py "
+        "--clusters-tsv {input.clusters_tsv} "
+        "--min-total-copy-number {config[copy_number_filter][min_total_copy_number]} "
+        "--out-png {output} > {log} 2>&1"
+
+
 rule filter_and_pool_clusters:
     input:
         clusters_tsv=expand("results/{entry_id}/all_clusters.tsv", entry_id=ENTRY_IDS),
@@ -467,6 +494,28 @@ rule plot_top_families:
         "--summary-tsv {input.summary} --individuals {params.individuals} "
         "--out-per-individual {output.per_individual} --out-global {output.global_png} "
         "--top-n {params.top_n} > {log} 2>&1"
+
+
+rule plot_copy_number_vs_recurrence:
+    # Post-harmonization diagnostic: one point per family (representative's
+    # own total_copy_number) vs. how many entries/methods independently
+    # confirmed it — recurrence a single-entry copy-number threshold can't
+    # see at all. Purely descriptive; no filtering/ranking logic here.
+    input:
+        summary="results/summary_table.tsv"
+    output:
+        "results/copy_number_vs_recurrence.png"
+    log:
+        "results/logs/plot_copy_number_vs_recurrence.log"
+    threads: config["resources"]["plot_copy_number_vs_recurrence"]["threads"]
+    resources:
+        mem=lambda wildcards, attempt: config["resources"]["plot_copy_number_vs_recurrence"]["mem"] * attempt,
+        hrs=config["resources"]["plot_copy_number_vs_recurrence"]["hrs"]
+    conda:
+        "workflow/envs/plotting.yaml"
+    shell:
+        "python workflow/scripts/plot_copy_number_vs_recurrence.py "
+        "--summary-tsv {input.summary} --out-png {output} > {log} 2>&1"
 
 
 # --- Step 7: known-repeat screening ---

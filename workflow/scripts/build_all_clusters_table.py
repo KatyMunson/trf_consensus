@@ -33,7 +33,7 @@ def main():
 
     columns = ["label", "motif", "target_period", "window", "rank",
                "n_input_sequences", "pct_of_bin", "consensus_length", "gc_content",
-               "total_copy_number"]
+               "total_copy_number", "mean_percent_match", "mean_entropy"]
     rows_out = []
     for i in range(n):
         motif, period, window = args.motifs[i], args.periods[i], args.windows[i]
@@ -43,6 +43,7 @@ def main():
                 "rank": r["rank"], "n_input_sequences": r["n_input_sequences"],
                 "pct_of_bin": r["pct_of_bin"], "consensus_length": r["consensus_length"],
                 "gc_content": r["gc_content"], "total_copy_number": r["total_copy_number"],
+                "mean_percent_match": r["mean_percent_match"], "mean_entropy": r["mean_entropy"],
             })
 
     rows_out.sort(key=lambda r: int(r["n_input_sequences"]), reverse=True)

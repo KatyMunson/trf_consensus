@@ -6,8 +6,8 @@ Pull entries from one or more native TRF .dat files whose period size
 (field 3) falls within [period - window, period + window], and write the
 per-entry consensus motif (field 14) to one combined FASTA file. A
 companion TSV records provenance/QC metadata (source sequence,
-coordinates, copy number, consensus size, percent match) so entries can be
-traced back to the .dat file(s) later.
+coordinates, copy number, consensus size, percent match, entropy) so
+entries can be traced back to the .dat file(s) later.
 
 Multiple --dat files are pooled into one output pair, not kept separate —
 this is the haplotype-pooling step for manifest entries whose assembly
@@ -69,7 +69,9 @@ def main():
     files_without_headers = []
 
     with open(args.out_fasta, "w") as fa, open(args.out_tsv, "w") as tsv:
-        tsv.write("id\tsource_seq\tstart\tend\tperiod\tcopy_number\tconsensus_size\tpercent_match\n")
+        tsv.write(
+            "id\tsource_seq\tstart\tend\tperiod\tcopy_number\tconsensus_size\tpercent_match\tentropy\n"
+        )
 
         for file_idx, dat_path in enumerate(args.dat):
             id_prefix = f"h{file_idx}:" if multi_file else ""
@@ -112,6 +114,7 @@ def main():
                         copy_number = fields[3]
                         consensus_size = fields[4]
                         percent_match = fields[5]
+                        entropy = fields[12]
                         consensus_seq = fields[13]
                     except (IndexError, ValueError):
                         sys.stderr.write(
@@ -124,7 +127,7 @@ def main():
                         fa.write(f">{entry_id}\n{consensus_seq}\n")
                         tsv.write(
                             f"{entry_id}\t{current_seq}\t{start}\t{end}\t{period}\t"
-                            f"{copy_number}\t{consensus_size}\t{percent_match}\n"
+                            f"{copy_number}\t{consensus_size}\t{percent_match}\t{entropy}\n"
                         )
                         n_written += 1
 
