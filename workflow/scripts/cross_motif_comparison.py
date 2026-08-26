@@ -42,6 +42,7 @@ test, not just a stricter identity cutoff. n_copies_found==1 is reported as
 duplicate build from the shorter one).
 """
 import argparse
+import hashlib
 import itertools
 import random
 import sys
@@ -197,6 +198,16 @@ def dinucleotide_shuffle(seq, rng, max_tries=100):
     return "".join(out)
 
 
+def pair_seed(shuffle_seed, label_a, label_b):
+    """Deterministic per-pair seed derived from (shuffle_seed, label_a,
+    label_b), independent of processing order — needed so parallelizing
+    (sharding or multiprocessing) doesn't change results, since Python's
+    built-in hash() on strings is randomized per-process and can't be used
+    here."""
+    h = hashlib.sha256(f"{shuffle_seed}\0{label_a}\0{label_b}".encode()).digest()
+    return int.from_bytes(h[:8], "big")
+
+
 def null_pass_count(unit, target, min_identity, max_copies, min_coverage, n_shuffles, rng,
                      shuffle_mode="mono"):
     """How many of n_shuffles shuffled versions of `unit` achieve
@@ -244,13 +255,32 @@ def main():
                           "composition only; 'di' is an Altschul-Erikson dinucleotide-preserving "
                           "shuffle, a stricter null more appropriate for compositionally "
                           "structured satellite sequence.")
+    ap.add_argument("--null-test-skip-margin", type=float, default=0.0,
+                     help="A candidate pair skips the shuffle null test entirely (auto-confirmed, "
+                          "null_passes recorded as 'skipped_high_confidence') when it clears both "
+                          "coverage >= min_coverage + margin and mean_identity >= min_identity + "
+                          "margin. Default 0.0 = feature off, current behavior preserved.")
+    ap.add_argument("--shard-index", type=int, default=0,
+                     help="0-based index of this shard (see --num-shards).")
+    ap.add_argument("--num-shards", type=int, default=1,
+                     help="Split all pairs into this many contiguous shards and only process "
+                          "--shard-index's slice. Default 1 = process every pair, identical to "
+                          "not sharding at all.")
     args = ap.parse_args()
+    if not (0 <= args.shard_index < args.num_shards):
+        ap.error(f"--shard-index must be in [0, {args.num_shards}), got {args.shard_index}")
 
     entries = read_multi_fasta(args.fastas)
     if not entries:
         sys.stderr.write("[cross_motif_comparison] no sequences found in input\n")
 
-    rng = random.Random(args.shuffle_seed)
+    n_entries = len(entries)
+    total_pairs = n_entries * (n_entries - 1) // 2
+    shard_start = args.shard_index * total_pairs // args.num_shards
+    shard_stop = (args.shard_index + 1) * total_pairs // args.num_shards
+    pair_iter = itertools.islice(
+        itertools.combinations(entries, 2), shard_start, shard_stop
+    )
 
     columns = [
         "label_A", "label_B", "len_A", "len_B", "length_ratio",
@@ -259,14 +289,25 @@ def main():
     ]
     rows = []
     n_candidate_pairs = 0
+    n_prefiltered = 0
+    n_null_tested = 0
+    n_skipped_high_confidence = 0
 
-    for (label_a, seq_a), (label_b, seq_b) in itertools.combinations(entries, 2):
+    for (label_a, seq_a), (label_b, seq_b) in pair_iter:
         # Order so A is the shorter (or equal) sequence — A is always the
         # tiling unit, B is always the target being tiled/explained.
         if len(seq_a) > len(seq_b):
             label_a, seq_a, label_b, seq_b = label_b, seq_b, label_a, seq_a
         len_a, len_b = len(seq_a), len(seq_b)
         ratio = len_b / len_a if len_a else float("nan")
+
+        # Exact, lossless pre-filter: given how max_copies is computed
+        # below, the maximum achievable coverage for this pair is bounded
+        # by max_copies / ratio, so a pair can be skipped outright — no
+        # edlib call — whenever that bound can't reach min_coverage.
+        if len_a and ratio > args.max_copies / args.min_coverage:
+            n_prefiltered += 1
+            continue
 
         max_copies = min(args.max_copies, int(ratio) + 2) if len_a else 1
         coverage, mean_identity, n_copies = tile_coverage(
@@ -279,11 +320,21 @@ def main():
 
         if candidate:
             n_candidate_pairs += 1
-            null_passes = null_pass_count(
-                seq_a, seq_b, args.min_identity, max_copies, args.min_coverage,
-                args.n_shuffles, rng, shuffle_mode=args.shuffle_mode
-            )
-            confirmed = null_passes <= args.max_null_passes
+            if args.null_test_skip_margin > 0 and (
+                coverage >= args.min_coverage + args.null_test_skip_margin
+                and mean_identity >= args.min_identity + args.null_test_skip_margin
+            ):
+                null_passes = "skipped_high_confidence"
+                confirmed = True
+                n_skipped_high_confidence += 1
+            else:
+                pair_rng = random.Random(pair_seed(args.shuffle_seed, label_a, label_b))
+                null_passes = null_pass_count(
+                    seq_a, seq_b, args.min_identity, max_copies, args.min_coverage,
+                    args.n_shuffles, pair_rng, shuffle_mode=args.shuffle_mode
+                )
+                confirmed = null_passes <= args.max_null_passes
+                n_null_tested += 1
             flag_similar = confirmed and n_copies == 1
             flag_multiple = confirmed and n_copies >= 2
 
@@ -306,9 +357,13 @@ def main():
 
     n_flagged = sum(1 for r in rows if r["flag_similar"] or r["flag_multiple_of"])
     sys.stderr.write(
-        f"[cross_motif_comparison] {len(entries)} sequences, {len(rows)} pairs compared, "
-        f"{n_candidate_pairs} passed the flat threshold, {n_flagged} confirmed by "
-        f"randomization test (max {args.max_null_passes}/{args.n_shuffles} shuffles allowed to pass)\n"
+        f"[cross_motif_comparison] shard {args.shard_index}/{args.num_shards}: "
+        f"{len(entries)} sequences, {shard_stop - shard_start} pairs in shard "
+        f"({n_prefiltered} pre-filtered, {len(rows)} pairs compared), "
+        f"{n_candidate_pairs} passed the flat threshold "
+        f"({n_null_tested} null-tested, {n_skipped_high_confidence} skipped high-confidence), "
+        f"{n_flagged} confirmed by randomization test "
+        f"(max {args.max_null_passes}/{args.n_shuffles} shuffles allowed to pass)\n"
     )
 
 

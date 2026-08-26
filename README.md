@@ -36,7 +36,7 @@ plot_copy_number_qc_diagnostic  (results/copy_number_qc_scatter.png)
 filter_and_pool_clusters  (drop below min_total_copy_number, pool across entries)
         |
         v
-cross_cluster_comparison
+cross_cluster_comparison  (sharded)  ->  concatenate_cross_cluster_comparison
         |
         v
 resolve_redundancy  (names families, annotates provenance)
@@ -146,6 +146,28 @@ plot_copy_number_vs_recurrence  (results/copy_number_vs_recurrence.png)
    otherwise inflate the false-positive rate beyond what the raw identity
    threshold implies, especially for short or compositionally simple
    sequences.
+
+   With multi-entry pooling, the number of pooled clusters compared here
+   (and thus the O(N²) pair count) grows well beyond what the earlier
+   single-assembly pipeline was sized for, so this step gets three
+   performance changes on top of the unchanged comparison logic above:
+   - An **exact, lossless pre-filter**: a pair whose length ratio is too
+     large for `max_copies` tiled copies to ever reach `min_coverage` is
+     skipped before any alignment work, with no accuracy tradeoff — it
+     falls straight out of the existing `max_copies`/`min_coverage` values.
+   - An **opt-in approximation**, `null_test_skip_margin` (default `0.0`,
+     off), that auto-confirms a candidate pair without running the shuffle
+     test when it clears both `min_coverage` and `min_identity` by at least
+     the margin — see the config section below before enabling it.
+   - **Sharding**: the rule runs as `num_shards` parallel Snakemake jobs,
+     each processing a contiguous slice of the pair list via
+     `--shard-index`/`--num-shards`, then `concatenate_cross_cluster_comparison`
+     joins them back into the same `results/cross_cluster_comparison.tsv`
+     filename and schema `resolve_redundancy` already expects. Each
+     candidate pair's shuffle-null RNG is seeded deterministically from
+     `(shuffle_seed, label_A, label_B)` rather than one shared sequential
+     stream, so results are identical regardless of shard count or
+     execution order.
 9. **`resolve_redundancy`** processes pooled clusters in descending
    `total_copy_number` order (not `n_input_sequences` — copy number is the
    fair cross-entry/cross-method support metric now that pooling is
@@ -164,12 +186,60 @@ plot_copy_number_vs_recurrence  (results/copy_number_vs_recurrence.png)
    different entries' independent MSAs can legitimately disagree by a base
    or two) and `letter` disambiguates families that happen to share a
    motif_length, assigned in discovery order. Every row is annotated with
-   which entries/individuals/methods its family was found in. Nothing is
-   dropped — non-representative members are kept in both the summary table
-   (`is_representative=False`) and the final RepeatMasker library, demoted
-   to `#Satellite/redundant_with_<final_name>` in the library's
-   classification field, so they're still visible (and RepeatMasker-usable)
-   but clearly lower priority.
+   which entries/individuals/methods its family was found in.
+
+   **Same-entry consolidation pre-pass**: before that global pass runs, the
+   exact same non-chained algorithm runs once per entry, scoped to that
+   entry's own clusters only, resolving them down to one "sub-winner" per
+   real family present in that entry — only sub-winners are fed into the
+   global pass. This exists because a single entry's TRF period scan can
+   nominate several candidate bins for the same real monomer (period jitter
+   surviving `nms_radius` suppression, e.g. periods 411/417/423 all mutually
+   flagged similar) — without this pre-pass, two such same-entry clusters
+   could each independently get flagged against the same external winner
+   and land in the same family without ever being compared to each other,
+   producing two disconnected, redundant rows in `summary_table.tsv` for
+   what's really one array (e.g. a monomer and its own dimer, tracked as
+   if independent) instead of one clean per-entry representative with
+   everything else folded into it. A cluster consolidated away within its entry records
+   which sub-winner it was folded into via `within_entry_consolidated_into`
+   (a separate, earlier provenance step from the global `is_representative`
+   demotion) and inherits that sub-winner's eventual family. Ranking always
+   uses a sub-winner's own `total_copy_number` as-is, never summed across
+   what it consolidated — bin extraction windows (`period ± window`) can
+   overlap, so summing risks double-counting the same raw TRF loci.
+
+   **Post-global same-entry deduplication**: the pre-pass alone isn't
+   sufficient — two same-entry sub-winners can also converge on the same
+   family *indirectly*, via independent links to a shared *external*
+   winner, without ever being directly flagged against each other (real
+   case: two clusters each independently cleared threshold against a
+   common external winner, but scored below `min_coverage` against each
+   other, so `flag_similar`/`flag_multiple_of` were both `False` for the
+   direct pair). The pre-pass can't see this — it only ever compares
+   candidates within one entry, never against a shared external target
+   that's only discovered once the global pass runs. So a second pass runs
+   immediately after the global pass: within each family, if more than one
+   member sub-winner shares an `entry_id`, the highest-`total_copy_number`
+   one is kept and the rest are re-homed under it (along with anything
+   they'd already consolidated within their own entry). Together, the two
+   passes give a structurally exhaustive guarantee — there are exactly two
+   ways a cluster can join a family (pre-pass within-entry consolidation,
+   or a direct/global match against the family's representative), and both
+   are now deduplicated by `entry_id`, so every entry that contributes to a
+   family has exactly one well-defined representative in the summary
+   table, direct or indirect convergence alike.
+
+   Nothing is dropped from the summary table — every original cluster call
+   still gets a row, non-representative members kept and marked
+   `is_representative=False`. Both passes' value is summary-table data
+   quality (one coherent per-entry representative per family, everything
+   else folded into it via `within_entry_consolidated_into`), not FASTA
+   correctness — the final RepeatMasker library is narrower still: **one
+   sequence per family**, just the global representative's own consensus
+   (see the results-files list below), so cross-entry/cross-method support
+   is recorded as metadata in the summary table rather than as duplicate
+   near-identical sequences in an annotation-ready library.
 10. **`plot_top_families`** reads the final summary table and produces one
     ranking bar chart per individual (that individual's own families, by the
     *max* `source_copy_number` across that individual's own entries — not a
@@ -321,7 +391,21 @@ fraction of the longer sequence that must be explained by tiled copies;
 `max_copies` (6) bounds how many tiled copies are searched for per pair;
 `n_shuffles` (20) and `max_null_passes` (0) control the randomization
 significance test — raise `max_null_passes` above 0 only if you want a more
-permissive (less strict) confirmation criterion.
+permissive (less strict) confirmation criterion. Dropping `n_shuffles` to
+roughly 8-10 is a reasonable way to roughly halve the null-test stage's
+cost while `max_null_passes` stays at 0, if runtime is still an issue after
+sharding — see the comment above the value in `configexample.yaml`.
+
+`num_shards` (default 4) splits the pairwise comparison across this many
+parallel Snakemake jobs (see the `cross_cluster_comparison` step above) —
+raise it for a larger pooled-cluster count / more available SGE slots, or
+set it to 1 to run as a single job like before sharding was added.
+`null_test_skip_margin` (default 0.0, off) is the opt-in shuffle-test
+shortcut described above — leave it at 0.0 unless you've validated a
+nonzero margin against a `margin=0` baseline run on your own data (compare
+`n_flagged` in the log between the two), since it changes the statistical
+guarantee for confirmed pairs. `configexample.yaml` documents two starting
+points (0.05 moderate, 0.10 conservative) if you decide to enable it.
 
 **`copy_number_filter`** — `min_total_copy_number` (default 500) is the
 per-entry cluster filter applied in `filter_and_pool_clusters`, before
@@ -382,11 +466,10 @@ Across entries:
   headers = `cluster_uid`
 - `results/cross_cluster_comparison.tsv` — pairwise similarity/multiple-of
   check across every pooled cluster
-- `results/repeatmasker_custom_lib.fasta` — **final output**: every
-  pooled cluster's consensus, headers as
-  `>{final_name}__{entry_id}#{classification}` (family representatives) or
-  `>{final_name}__{entry_id}#{classification}/redundant_with_{final_name}`
-  (other family members)
+- `results/repeatmasker_custom_lib.fasta` — **final output**: one record
+  per family (just its global representative's own consensus), headers as
+  `>{final_name}#{classification}`. Cross-entry/cross-method support lives
+  in `summary_table.tsv`, not as extra near-duplicate records here
 - `results/summary_table.tsv` — **final output**: one row per original
   cluster call, named/grouped into families with provenance — see the
   columns table below
@@ -410,12 +493,16 @@ specific candidate we found already known?" — and is much cheaper: ~100-250
 short sequences, well under a minute of actual RepeatMasker runtime
 regardless of library size, versus screening an entire genome.
 
-This step runs on `results/repeatmasker_custom_lib.fasta` (the final
-output — every cluster, winners and redundancy-demoted ones both, since a
-demoted cluster individually matching a known family is still useful
-information) and is wired into `rule all` alongside the other final
-outputs, consistent with this pipeline's fully-automatic design — there's
-no separate flag to opt in or out.
+This step runs on `results/repeatmasker_custom_lib.fasta` — one query per
+family, its global representative's own consensus — and is wired into
+`rule all` alongside the other final outputs, consistent with this
+pipeline's fully-automatic design — there's no separate flag to opt in or
+out. Redundant per-entry duplicates (see `within_entry_consolidated_into`
+in `summary_table.tsv`) are no longer screened independently, only their
+family's single representative is — since they're near-identical
+sequences by construction, this is very unlikely to change any real
+hit/no-hit outcome, and avoids screening several near-duplicate records
+for what's really one question ("is this family already known?").
 
 **Pipeline**: `prepare_known_repeat_query` (strips our own
 `#classification` suffix off each header, since it's not a valid
@@ -457,17 +544,17 @@ was contained to that directory, `rm -rf RM_*` in the repo root).
   real match wraps around the end of a single un-doubled copy. Same trick
   used internally elsewhere in this pipeline (`cross_motif_comparison.py`).
 
-**Reading `known_repeat_hits.tsv`**: every library entry (identified by its
-FASTA header up to the first `#`, i.e. `{final_name}__{entry_id}` — the
-same join key you'd reconstruct from `summary_table.tsv`'s `final_name` +
-`source_entry_id`) is present, but **this is not guaranteed to be one row
-per entry** — an entry with no hit gets exactly one row
+**Reading `known_repeat_hits.tsv`**: every family (identified by its FASTA
+header up to the first `#`, i.e. `final_name` directly — the same key
+`summary_table.tsv`'s `final_name` column already uses, no reconstruction
+needed) is present, but **this is not guaranteed to be one row per
+family** — a family with no hit gets exactly one row
 (`has_known_hit=False`, rest `NA`), a normal, common, and often *expected*
 outcome, not a failure (much of the satellite DNA in a non-model species
-genome is genuinely undescribed in existing databases); an entry with hits
+genome is genuinely undescribed in existing databases); a family with hits
 gets **one row per distinct matched repeat name**, so a motif that matches
 two unrelated known families shows up as two rows. If you need exactly one
-row per entry (e.g. for a simple join), sort by `reciprocal_overlap`
+row per family (e.g. for a simple join), sort by `reciprocal_overlap`
 descending and keep the first row per label. `repeat_name` /
 `repeat_class_family` identify each match, `sw_score` / `pct_divergence`
 describe its quality, and:
@@ -564,16 +651,23 @@ informative if the library actually had something to compare against.
 ## `results/summary_table.tsv` columns
 
 One row per original cluster call — nothing dropped, non-representative
-family members are kept and marked `is_representative=False`.
+family members are kept and marked `is_representative=False`. Note that
+`is_representative=False` covers two distinct demotions now (see "Pipeline"
+step 9's same-entry consolidation pre-pass): a row can be demoted globally
+(lost the cross-entry pass to some other entry's stronger cluster) and/or
+consolidated within its own entry first (folded into that entry's own
+sub-winner before the global pass ever ran) — `within_entry_consolidated_into`
+is what distinguishes the latter.
 
 | column | meaning |
 |---|---|
-| `final_name` | `SAT{motif_length}_{letter}` — the harmonized family name. Matches the FASTA header prefix in `repeatmasker_custom_lib.fasta` (`{final_name}__{source_entry_id}`) |
+| `final_name` | `SAT{motif_length}_{letter}` — the harmonized family name. Matches the FASTA header in `repeatmasker_custom_lib.fasta` (`>{final_name}#{classification}`, one record per family) |
 | `motif_length` | the family's representative cluster's own exact `consensus_length` (no rounding/averaging) |
-| `is_representative` | True for the one row per family with the highest `source_copy_number` — its consensus is what goes in the RepeatMasker library unqualified; other rows are `#Satellite/redundant_with_{final_name}` |
+| `is_representative` | True for the single row per family with the highest `source_copy_number` overall — its consensus is what goes in the RepeatMasker library unqualified; every other row (globally demoted or within-entry-consolidated) is `False` |
+| `within_entry_consolidated_into` | `NA` if this row was its own entry's sub-winner (went into the global pass directly); otherwise the `source_cluster_label` of the sub-winner it was folded into within its own entry, before the global pass ran |
 | `source_entry_id` / `source_individual` / `source_assembly_method` / `source_phasing_status` | which manifest entry this specific cluster call came from |
 | `source_cluster_label` | that entry's own cluster label (`{motif}_rank{rank}_n{N}`), before pooling |
-| `source_copy_number` | this cluster's own `total_copy_number` (summed raw TRF copy number, not locus count) — the ranking key resolve_redundancy used |
+| `source_copy_number` | this cluster's own `total_copy_number` (summed raw TRF copy number, not locus count) — the ranking key resolve_redundancy used at both the within-entry and global level (never summed across consolidated duplicates) |
 | `source_consensus_length` / `source_gc_content` | of this specific cluster's own consensus (can differ slightly from `motif_length` — see "Pipeline" step 9) |
 | `n_entries_found` / `entries_found` | how many / which manifest entries this family was found in at all |
 | `n_individuals_present` / `individuals_found` | how many / which individuals this family was found in |
