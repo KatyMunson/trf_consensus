@@ -648,6 +648,56 @@ check against whatever you just configured —
 zeros the way the 4.1.5 library was. A `has_known_hit=False` result is only
 informative if the library actually had something to compare against.
 
+## Genome-wide satellite screening (`satellite_screen`)
+
+A standalone target, **not** wired into `rule all` — run it explicitly:
+
+```
+snakemake -s Snakefile --configfile config/config.yaml satellite_screen --use-conda --retries 3
+```
+
+Unlike the known-repeat screening step above (which screens our own
+discovered consensus motifs against Dfam/RepBase), this step runs
+RepeatMasker with `-lib results/repeatmasker_custom_lib.fasta` against each
+manifest entry's **original assembly fasta**, then cross-checks those hits
+against TRF's own raw `.dat` loci. The question it answers is: *did we
+find/keep the motif for this TRF-flagged satellite-like block, or lose it
+somewhere in the pipeline?* It is explicitly **not** a whole-genome
+Dfam-based annotation comparison — the default Dfam library for this taxon
+isn't trustworthy enough to use as ground truth here (see the "Known-repeat
+screening" troubleshooting above).
+
+A locus is flagged "likely satellite" using the same locus-level thresholds
+`candidate_scan` uses (`min_copy_number`, `min_single_block_copy_number`,
+`min_period_length`) — but evaluated per-locus, not per-window, so
+`candidate_scan`'s `min_blocks` corroboration requirement does not apply
+here. This is intentionally more permissive than `candidate_scan`'s own
+candidate nomination: an isolated locus can be flagged here even without
+neighboring support.
+
+Config knobs (`satellite_screen` block in `config.yaml`):
+- `merge_distance` — gap tolerance (bp) for merging nearby passing TRF loci
+  into one region before evaluating coverage.
+- `min_coverage_fraction` — fraction of a region's length that must be
+  overlapped by a `-lib` hit to count as "covered" in the per-region
+  breakdown and the histogram. Does not affect the overall bp recall
+  reported in `coverage_summary.tsv`, which sums actual overlapping bp
+  across all regions regardless of this threshold.
+
+Outputs (`results/genome_satellite_screen/`):
+- `overall_coverage_summary.tsv` — one row per sample plus an `ALL` row:
+  total likely-satellite bp, covered bp, overall bp recall, region counts,
+  and region-level recall.
+- `overall_coverage_histogram.png` — genome-wide histogram of
+  likely-satellite region sizes, split by covered vs. not covered.
+- Per-sample `{sample}/coverage_summary.tsv`, `{sample}/missing_regions.tsv`,
+  `{sample}/regions_with_coverage.tsv`.
+- `satellite_arrays_manifest.tsv` — `# sample  rm_out  assembly_fasta`,
+  one row per sample/haplotype, with absolute paths. This can be copied in
+  directly as the `satellite_arrays` pipeline's own `manifest.tsv` (see that
+  repo) to hand its RepeatMasker `.out` files straight to that pipeline's
+  next step.
+
 ## `results/summary_table.tsv` columns
 
 One row per original cluster call — nothing dropped, non-representative

@@ -686,3 +686,236 @@ rule parse_known_repeat_hits:
         "python workflow/scripts/parse_repeatmasker_hits.py "
         "--rm-out {input.rm_out} --query-fasta {input.query_fasta} --out-tsv {output} "
         "{params.doubled_flag} > {log} 2>&1"
+
+
+# --- Step 8: genome-wide -lib screening + TRF coverage evaluation ---
+# Runs RepeatMasker -lib against each ORIGINAL assembly fasta (not just our
+# own consensus motifs, unlike Step 7) to check where in the actual genome
+# our discovered library hits, then cross-checks that against TRF's own raw
+# loci to see whether satellite-looking TRF blocks (same thresholds as
+# candidate_scan) are actually being covered by a family we kept, or got
+# lost somewhere along the way. Feeds the satellite_arrays pipeline next --
+# write_satellite_arrays_manifest emits its manifest.tsv directly. NOT
+# wired into `rule all`: run explicitly via `snakemake satellite_screen`,
+# since this is a downstream sanity check, not a required deliverable of
+# this pipeline's normal automatic run.
+
+GENOME_SAMPLES = {}  # sample_id -> {"fasta": path, "dat": path, "entry_id": entry_id}
+for entry_id, entry in MANIFEST.items():
+    fasta_paths = entry["fasta_paths"].split(";")
+    dat_paths = entry["trf_dat_paths"].split(";")
+    if entry["phasing_status"] == "phased_pooled":
+        if len(fasta_paths) != 2 or len(dat_paths) != 2:
+            raise ValueError(f"{entry_id}: phased_pooled entry needs exactly 2 fasta_paths and 2 trf_dat_paths")
+        for fasta, dat in zip(fasta_paths, dat_paths):
+            if "hap1" in os.path.basename(fasta):
+                hap = "hap1"
+            elif "hap2" in os.path.basename(fasta):
+                hap = "hap2"
+            else:
+                raise ValueError(
+                    f"{entry_id}: fasta path {fasta} contains neither 'hap1' nor "
+                    f"'hap2' -- can't assign a haplotype suffix"
+                )
+            GENOME_SAMPLES[f"{entry_id}_{hap}"] = {"fasta": fasta, "dat": dat, "entry_id": entry_id}
+    else:
+        GENOME_SAMPLES[entry_id] = {"fasta": fasta_paths[0], "dat": dat_paths[0], "entry_id": entry_id}
+
+GENOME_SAMPLE_IDS = list(GENOME_SAMPLES)
+
+
+rule satellite_screen:
+    input:
+        "results/genome_satellite_screen/overall_coverage_summary.tsv",
+        "results/genome_satellite_screen/overall_coverage_histogram.png",
+        expand("results/genome_satellite_screen/{sample}/missing_regions.tsv", sample=GENOME_SAMPLE_IDS),
+        "results/genome_satellite_screen/satellite_arrays_manifest.tsv",
+
+
+rule stage_genome_fasta:
+    # Symlinks the original assembly fasta into a controlled path/filename
+    # so run_repeatmasker_genome_lib's output name is predictable regardless
+    # of the source path's actual basename (same reasoning as
+    # prepare_known_repeat_query producing a controlled query.fasta).
+    input:
+        lambda wc: GENOME_SAMPLES[wc.sample]["fasta"]
+    output:
+        "results/genome_satellite_screen/{sample}/genome.fasta"
+    log:
+        "results/logs/genome_satellite_screen/{sample}/stage_genome_fasta.log"
+    threads: config["resources"]["stage_genome_fasta"]["threads"]
+    resources:
+        mem=lambda wildcards, attempt: config["resources"]["stage_genome_fasta"]["mem"] * attempt,
+        hrs=config["resources"]["stage_genome_fasta"]["hrs"]
+    shell:
+        "ln -sf $(readlink -f {input}) {output} 2> {log}"
+
+
+rule run_repeatmasker_genome_lib:
+    # Same pipeline-owned, conda-only RepeatMasker install as
+    # run_repeatmasker_known_screen (workflow/envs/repeatmasker.yaml) --
+    # deliberately not envmodules. -lib mode itself doesn't need FamDB, but
+    # this RepeatMasker build fails to write a proper .out header at all if
+    # FamDB isn't configured, regardless of mode. Since
+    # run_repeatmasker_known_screen already works, FamDB is already
+    # configured for this env -- reuse it as-is.
+    input:
+        fasta="results/genome_satellite_screen/{sample}/genome.fasta",
+        lib="results/repeatmasker_custom_lib.fasta"
+    output:
+        "results/genome_satellite_screen/{sample}/genome.fasta.out"
+    params:
+        outdir="results/genome_satellite_screen/{sample}",
+        fasta_abs=lambda wc, input: os.path.abspath(input.fasta),
+        lib_abs=lambda wc, input: os.path.abspath(input.lib)
+    log:
+        "results/logs/genome_satellite_screen/{sample}/run_repeatmasker_genome_lib.log"
+    threads: config["resources"]["run_repeatmasker_genome_lib"]["threads"]
+    resources:
+        mem=lambda wildcards, attempt: config["resources"]["run_repeatmasker_genome_lib"]["mem"] * attempt,
+        hrs=config["resources"]["run_repeatmasker_genome_lib"]["hrs"]
+    conda:
+        "workflow/envs/repeatmasker.yaml"
+    shell:
+        # Same cwd/scratch-dir reasoning as run_repeatmasker_known_screen:
+        # RepeatMasker's RM_<pid> scratch dir is always created relative to
+        # actual cwd (regardless of -dir), and only self-deletes via the
+        # very last line of RepeatMasker's own script -- any crash/die
+        # skips that. Subshell + trap contains/guarantees cleanup inside
+        # this sample's own output dir the same way run_repeatmasker_known_screen
+        # contains it under results/known_repeat_screen/, instead of leaving
+        # RM_* debris behind on a failed run. Snakemake's default bash strict
+        # mode (set -euo pipefail) means a non-zero RepeatMasker exit aborts
+        # before `touch {output}` is reached; `&& touch {output}` covers the
+        # legitimate zero-hit case where RepeatMasker exits 0 but writes no
+        # .out file, same as run_repeatmasker_known_screen.
+        "(cd {params.outdir} && trap 'rm -rf RM_*' EXIT && "
+        "RepeatMasker -pa {threads} -lib {params.lib_abs} -dir . {params.fasta_abs}) "
+        "> {log} 2>&1 && touch {output}"
+
+
+rule trf_dat_to_satellite_bed:
+    input:
+        dat=lambda wc: GENOME_SAMPLES[wc.sample]["dat"],
+        script="workflow/scripts/trf_dat_to_satellite_bed.py"
+    output:
+        "results/genome_satellite_screen/{sample}/likely_satellite_regions.bed"
+    params:
+        min_copy_number=config["candidate_scan"]["min_copy_number"],
+        min_single_block_copy_number=config["candidate_scan"]["min_single_block_copy_number"],
+        min_period_length=config["candidate_scan"]["min_period_length"],
+        merge_distance=config["satellite_screen"]["merge_distance"],
+        default_seqname=config["trf_dat_default_seqname"]
+    log:
+        "results/logs/genome_satellite_screen/{sample}/trf_dat_to_satellite_bed.log"
+    threads: config["resources"]["trf_dat_to_satellite_bed"]["threads"]
+    resources:
+        mem=lambda wildcards, attempt: config["resources"]["trf_dat_to_satellite_bed"]["mem"] * attempt,
+        hrs=config["resources"]["trf_dat_to_satellite_bed"]["hrs"]
+    conda:
+        "workflow/envs/python_base.yaml"
+    envmodules:
+        "python/3.11"
+    shell:
+        "python workflow/scripts/trf_dat_to_satellite_bed.py "
+        "--dat {input.dat} --out-bed {output} "
+        "--min-copy-number {params.min_copy_number} "
+        "--min-single-block-copy-number {params.min_single_block_copy_number} "
+        "--min-period-length {params.min_period_length} "
+        "--merge-distance {params.merge_distance} "
+        "--default-seqname \"{params.default_seqname}\" "
+        "> {log} 2>&1"
+
+
+rule rm_lib_hits_to_bed:
+    input:
+        out="results/genome_satellite_screen/{sample}/genome.fasta.out",
+        script="workflow/scripts/rm_out_to_bed.py"
+    output:
+        "results/genome_satellite_screen/{sample}/lib_hits.bed"
+    log:
+        "results/logs/genome_satellite_screen/{sample}/rm_lib_hits_to_bed.log"
+    threads: config["resources"]["rm_lib_hits_to_bed"]["threads"]
+    resources:
+        mem=lambda wildcards, attempt: config["resources"]["rm_lib_hits_to_bed"]["mem"] * attempt,
+        hrs=config["resources"]["rm_lib_hits_to_bed"]["hrs"]
+    conda:
+        "workflow/envs/python_base.yaml"
+    envmodules:
+        "python/3.11"
+    shell:
+        "python workflow/scripts/rm_out_to_bed.py "
+        "--rm-out {input.out} --out-bed {output} > {log} 2>&1"
+
+
+rule evaluate_satellite_coverage:
+    input:
+        likely="results/genome_satellite_screen/{sample}/likely_satellite_regions.bed",
+        hits="results/genome_satellite_screen/{sample}/lib_hits.bed",
+        script="workflow/scripts/evaluate_satellite_coverage.py"
+    output:
+        summary="results/genome_satellite_screen/{sample}/coverage_summary.tsv",
+        missing="results/genome_satellite_screen/{sample}/missing_regions.tsv",
+        regions="results/genome_satellite_screen/{sample}/regions_with_coverage.tsv"
+    params:
+        min_coverage_fraction=config["satellite_screen"]["min_coverage_fraction"]
+    log:
+        "results/logs/genome_satellite_screen/{sample}/evaluate_satellite_coverage.log"
+    threads: config["resources"]["evaluate_satellite_coverage"]["threads"]
+    resources:
+        mem=lambda wildcards, attempt: config["resources"]["evaluate_satellite_coverage"]["mem"] * attempt,
+        hrs=config["resources"]["evaluate_satellite_coverage"]["hrs"]
+    conda:
+        "workflow/envs/python_base.yaml"
+    envmodules:
+        "python/3.11"
+    shell:
+        "python workflow/scripts/evaluate_satellite_coverage.py "
+        "--likely-bed {input.likely} --hits-bed {input.hits} "
+        "--sample {wildcards.sample} "
+        "--min-coverage-fraction {params.min_coverage_fraction} "
+        "--out-summary {output.summary} --out-missing {output.missing} "
+        "--out-regions {output.regions} > {log} 2>&1"
+
+
+rule aggregate_satellite_coverage:
+    input:
+        summaries=expand("results/genome_satellite_screen/{sample}/coverage_summary.tsv", sample=GENOME_SAMPLE_IDS),
+        regions=expand("results/genome_satellite_screen/{sample}/regions_with_coverage.tsv", sample=GENOME_SAMPLE_IDS),
+        script="workflow/scripts/aggregate_satellite_coverage.py"
+    output:
+        summary="results/genome_satellite_screen/overall_coverage_summary.tsv",
+        histogram="results/genome_satellite_screen/overall_coverage_histogram.png"
+    log:
+        "results/logs/genome_satellite_screen/aggregate_satellite_coverage.log"
+    threads: config["resources"]["aggregate_satellite_coverage"]["threads"]
+    resources:
+        mem=lambda wildcards, attempt: config["resources"]["aggregate_satellite_coverage"]["mem"] * attempt,
+        hrs=config["resources"]["aggregate_satellite_coverage"]["hrs"]
+    conda:
+        "workflow/envs/plotting.yaml"
+    shell:
+        "python workflow/scripts/aggregate_satellite_coverage.py "
+        "--summaries {input.summaries} --regions {input.regions} "
+        "--out-summary {output.summary} --out-histogram {output.histogram} > {log} 2>&1"
+
+
+rule write_satellite_arrays_manifest:
+    # Direct handoff to the satellite_arrays pipeline: sample / rm_out /
+    # assembly_fasta, one row per haplotype -- exactly its manifest.tsv
+    # schema.
+    input:
+        expand("results/genome_satellite_screen/{sample}/genome.fasta.out", sample=GENOME_SAMPLE_IDS)
+    output:
+        "results/genome_satellite_screen/satellite_arrays_manifest.tsv"
+    threads: config["resources"]["write_satellite_arrays_manifest"]["threads"]
+    resources:
+        mem=lambda wildcards, attempt: config["resources"]["write_satellite_arrays_manifest"]["mem"] * attempt,
+        hrs=config["resources"]["write_satellite_arrays_manifest"]["hrs"]
+    run:
+        with open(output[0], "w") as f:
+            f.write("# sample\trm_out\tassembly_fasta\n")
+            for sample_id, info in GENOME_SAMPLES.items():
+                rm_out = os.path.abspath(f"results/genome_satellite_screen/{sample_id}/genome.fasta.out")
+                fasta = os.path.abspath(info["fasta"])
+                f.write(f"{sample_id}\t{rm_out}\t{fasta}\n")

@@ -51,6 +51,17 @@ candidate_scan:
   nms_radius: 5           # suppression radius so nearby period values don't get
                           # reported as separate candidates (see scan_dat_candidates.py)
 
+# --- Genome-wide -lib screening + TRF coverage evaluation (Step 8) ---
+# Not part of the automatic pipeline -- run via `snakemake satellite_screen`.
+satellite_screen:
+  # Gap tolerance (bp) for merging nearby passing TRF loci into one region.
+  merge_distance: 2000
+  # Fraction of a likely-satellite region's length that must be overlapped
+  # by a -lib hit to count as "covered" in the histogram/missing list. The
+  # overall bp recall % in coverage_summary.tsv is unaffected by this --
+  # it sums actual overlapping bp across all regions regardless.
+  min_coverage_fraction: 0.5
+
 # --- Step 2: iterative cluster ranking (per bin) ---
 # Repeatedly peels off the largest coherent sequence cluster from a bin,
 # ranks all discovered clusters by size. O(rounds x N), not O(N^2) all-vs-all.
@@ -193,6 +204,34 @@ resources:
     mem: 8
     hrs: 2
   parse_known_repeat_hits:
+    threads: 1
+    mem: 2
+    hrs: 1
+  stage_genome_fasta:
+    threads: 1
+    mem: 4
+    hrs: 1
+  run_repeatmasker_genome_lib:
+    threads: 8
+    mem: 16
+    hrs: 8
+  trf_dat_to_satellite_bed:
+    threads: 1
+    mem: 8
+    hrs: 1
+  rm_lib_hits_to_bed:
+    threads: 1
+    mem: 4
+    hrs: 1
+  evaluate_satellite_coverage:
+    threads: 1
+    mem: 4
+    hrs: 1
+  aggregate_satellite_coverage:
+    threads: 1
+    mem: 4
+    hrs: 1
+  write_satellite_arrays_manifest:
     threads: 1
     mem: 2
     hrs: 1
