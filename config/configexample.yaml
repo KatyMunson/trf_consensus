@@ -15,6 +15,16 @@
 # worked example and the README's "Manifest" section for the full schema.
 manifest: "config/manifest.tsv"
 
+# Flat top-level key (not nested under satellite_screen:) so it can be overridden
+# from the command line without editing this file: --config satellite_screen_manifest=path.
+# Optional -- same manifest.tsv schema as `manifest:` above. Defaults to the main
+# manifest if unset/not overridden. Read only by satellite_screen/Snakefile (a
+# separate Snakefile, not part of this pipeline's normal run -- see its own header
+# comment and the README's "Genome-wide satellite screening" section). Use this to
+# evaluate a new assembly against the CURRENT repeatmasker_custom_lib.fasta without
+# touching the main pipeline or manifest.
+# satellite_screen_manifest: "config/supplemental_manifest.tsv"
+
 # Source contig/scaffold name to label entries with when a .dat file has no
 # header lines at all (neither "Sequence: <name>" nor "@<name>" -ngs style).
 # Leave "" if your .dat files have real headers. This is a single global
@@ -51,8 +61,10 @@ candidate_scan:
   nms_radius: 5           # suppression radius so nearby period values don't get
                           # reported as separate candidates (see scan_dat_candidates.py)
 
-# --- Genome-wide -lib screening + TRF coverage evaluation (Step 8) ---
-# Not part of the automatic pipeline -- run via `snakemake satellite_screen`.
+# --- Genome-wide -lib screening + TRF coverage evaluation ---
+# Not part of the automatic pipeline -- its own Snakefile, satellite_screen/Snakefile,
+# run via `snakemake -s satellite_screen/Snakefile ... satellite_screen`. See that
+# file's header comment and the README's "Genome-wide satellite screening" section.
 satellite_screen:
   # Gap tolerance (bp) for merging nearby passing TRF loci into one region.
   merge_distance: 2000
@@ -61,6 +73,14 @@ satellite_screen:
   # overall bp recall % in coverage_summary.tsv is unaffected by this --
   # it sums actual overlapping bp across all regions regardless.
   min_coverage_fraction: 0.5
+  # Number of chunks run_repeatmasker_genome_lib is sharded into per sample
+  # (snake/boustrophedon split by contig count, see workflow/scripts/split_fasta.py).
+  # Don't set higher than your smallest sample's contig count, or later shards get
+  # an empty chunk fasta. ~2 threads/shard (see resources.run_repeatmasker_genome_lib
+  # below) keeps a similar aggregate core footprint to the old unsharded 8-thread
+  # invocation while giving SGE 6 smaller, more schedulable jobs instead of 1 big
+  # one -- tune both to your cluster's actual spare job-slot capacity.
+  repeatmasker_num_shards: 6
 
 # --- Step 2: iterative cluster ranking (per bin) ---
 # Repeatedly peels off the largest coherent sequence cluster from a bin,
@@ -211,10 +231,22 @@ resources:
     threads: 1
     mem: 4
     hrs: 1
+  stage_repeatmasker_lib_snapshot:
+    threads: 1
+    mem: 2
+    hrs: 1
+  split_genome_repeatmasker_fasta:
+    threads: 1
+    mem: 4
+    hrs: 1
   run_repeatmasker_genome_lib:
-    threads: 8
-    mem: 16
-    hrs: 8
+    threads: 2
+    mem: 8
+    hrs: 3
+  gather_repeatmasker_genome_lib:
+    threads: 1
+    mem: 2
+    hrs: 1
   trf_dat_to_satellite_bed:
     threads: 1
     mem: 8

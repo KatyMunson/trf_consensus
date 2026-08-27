@@ -650,22 +650,84 @@ informative if the library actually had something to compare against.
 
 ## Genome-wide satellite screening (`satellite_screen`)
 
-A standalone target, **not** wired into `rule all` — run it explicitly:
+Lives in its **own Snakefile**, `satellite_screen/Snakefile` — not a target
+in the main `Snakefile`, and not wired into `rule all`. Run it explicitly,
+from the repo root:
 
 ```
-snakemake -s Snakefile --configfile config/config.yaml satellite_screen --use-conda --retries 3
+snakemake -s satellite_screen/Snakefile --configfile config/config.yaml satellite_screen --use-conda --retries 3
 ```
+
+**Why a separate Snakefile.** `results/repeatmasker_custom_lib.fasta` sits
+downstream of the main pipeline's `scan_dat_candidates` checkpoint. Early on
+this lived as a target inside the main `Snakefile`, and every invocation
+forced Snakemake to re-derive DAG state through that checkpoint on every
+run — costing real minutes re-executing `filter_and_pool_clusters`/
+`cross_cluster_comparison`/`resolve_redundancy` for byte-identical output,
+even when nothing was stale. `satellite_screen/Snakefile` treats
+`results/repeatmasker_custom_lib.fasta` as a plain, pre-existing input file
+— no rule in that Snakefile produces it — so it never touches the main
+pipeline's checkpoint at all. If you haven't run the main pipeline yet, run
+it first; `satellite_screen` won't build `repeatmasker_custom_lib.fasta`
+for you.
+
+**Per-sample library snapshot and traceability.** `repeatmasker_custom_lib.fasta`
+is pooled and redundancy-resolved across *every* manifest entry, so adding
+one new sample genuinely changes its content — which legitimately means
+every existing sample's genome-vs-library screen should be re-evaluated
+against the new library, not just the new sample's. `satellite_screen`
+handles this by copying the current library into each sample's own output
+directory (`results/genome_satellite_screen/{sample}/repeatmasker_custom_lib.fasta`)
+before screening that sample against it — but only actually overwrites that
+copy when the library's *content* has genuinely changed (a cheap comparison,
+not a blind copy), so a `satellite_screen` run only re-screens a sample when
+the answer could actually be different, never from unrelated timestamp
+noise. This also means each sample's directory is self-documenting: the
+exact library file that produced its `.out` sits right next to it.
+
+**Evaluating a new assembly without touching the main pipeline.** Nothing
+`satellite_screen` needs per sample requires that sample to have gone
+through the main pipeline's own candidate-scanning/clustering/pooling
+steps — it only needs an assembly fasta and a raw TRF `.dat` file (both
+already-external inputs even for entries in the main manifest; the main
+pipeline never runs TRF itself). To evaluate a new assembly against
+whatever `repeatmasker_custom_lib.fasta` currently exists, without adding
+it to the main manifest or rebuilding anything: put it in a small
+supplemental manifest (same `manifest.tsv` schema) and point
+`satellite_screen` at it from the command line, without editing
+`config.yaml`:
+```
+snakemake -s satellite_screen/Snakefile --configfile config/config.yaml \
+  --config satellite_screen_manifest=config/supplemental_manifest.tsv \
+  satellite_screen --use-conda --retries 3
+```
+(`satellite_screen_manifest` defaults to the main `manifest:` if not set —
+this only takes effect when you explicitly override it.) Reusing an
+`entry_id`/sample name that already has output from a different assembly
+under `results/genome_satellite_screen/` is rejected with a loud error
+rather than silently overwritten.
+
+**Sharded RepeatMasker.** `run_repeatmasker_genome_lib` splits each sample's
+genome fasta into `satellite_screen.repeatmasker_num_shards` chunks (a
+snake/boustrophedon assignment by contig count — see
+`workflow/scripts/split_fasta.py` — ported from a sibling pipeline's own
+RepeatMasker scatter/gather pattern) and runs RepeatMasker on each chunk as
+a separate, smaller SGE job instead of one large one, gathering the results
+back into the same `genome.fasta.out` filename everything downstream
+expects. Tune `repeatmasker_num_shards` and the `run_repeatmasker_genome_lib`
+resource entry's `threads` together to your cluster's actual spare
+job-slot capacity — more, smaller jobs only help if your scheduler can
+actually run them concurrently.
 
 Unlike the known-repeat screening step above (which screens our own
 discovered consensus motifs against Dfam/RepBase), this step runs
-RepeatMasker with `-lib results/repeatmasker_custom_lib.fasta` against each
-manifest entry's **original assembly fasta**, then cross-checks those hits
-against TRF's own raw `.dat` loci. The question it answers is: *did we
-find/keep the motif for this TRF-flagged satellite-like block, or lose it
-somewhere in the pipeline?* It is explicitly **not** a whole-genome
-Dfam-based annotation comparison — the default Dfam library for this taxon
-isn't trustworthy enough to use as ground truth here (see the "Known-repeat
-screening" troubleshooting above).
+RepeatMasker with `-lib` against each manifest entry's **original assembly
+fasta**, then cross-checks those hits against TRF's own raw `.dat` loci. The
+question it answers is: *did we find/keep the motif for this TRF-flagged
+satellite-like block, or lose it somewhere in the pipeline?* It is
+explicitly **not** a whole-genome Dfam-based annotation comparison — the
+default Dfam library for this taxon isn't trustworthy enough to use as
+ground truth here (see the "Known-repeat screening" troubleshooting above).
 
 A locus is flagged "likely satellite" using the same locus-level thresholds
 `candidate_scan` uses (`min_copy_number`, `min_single_block_copy_number`,
@@ -683,6 +745,9 @@ Config knobs (`satellite_screen` block in `config.yaml`):
   breakdown and the histogram. Does not affect the overall bp recall
   reported in `coverage_summary.tsv`, which sums actual overlapping bp
   across all regions regardless of this threshold.
+- `repeatmasker_num_shards` — number of chunks `run_repeatmasker_genome_lib`
+  is sharded into per sample (see "Sharded RepeatMasker" above). Don't set
+  higher than your smallest sample's contig count.
 
 **`lib_hits.bed` includes RepeatMasker's own built-in low-complexity/simple-repeat
 calls, not just custom-library hits.** RepeatMasker always runs an internal
@@ -706,8 +771,10 @@ Outputs (`results/genome_satellite_screen/`):
   likely-satellite region sizes, split by covered vs. not covered.
 - Per-sample `{sample}/coverage_summary.tsv`, `{sample}/missing_regions.tsv`,
   `{sample}/regions_with_coverage.tsv` (computed from `lib_hits.bed` filtered
-  to the library's own classification, see above), and `{sample}/lib_hits.bed`
-  itself (unfiltered).
+  to the library's own classification, see above), `{sample}/lib_hits.bed`
+  itself (unfiltered), and `{sample}/repeatmasker_custom_lib.fasta` — the
+  exact library snapshot that produced that sample's `.out` (see "Per-sample
+  library snapshot and traceability" above).
 - `satellite_arrays_manifest.tsv` — `# sample  rm_out  assembly_fasta`,
   one row per sample/haplotype, with absolute paths. This can be copied in
   directly as the `satellite_arrays` pipeline's own `manifest.tsv` (see that
