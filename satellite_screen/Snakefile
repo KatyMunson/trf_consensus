@@ -49,7 +49,7 @@
 # screening" section for the full rationale and usage.
 #
 # Usage: snakemake -s satellite_screen/Snakefile --configfile config/config.yaml \
-#          satellite_screen --use-conda --retries 3
+#          --use-conda --retries 3 satellite_screen
 #
 # Author:  KM
 # Created: 2026-08

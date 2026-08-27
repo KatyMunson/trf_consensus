@@ -655,7 +655,7 @@ in the main `Snakefile`, and not wired into `rule all`. Run it explicitly,
 from the repo root:
 
 ```
-snakemake -s satellite_screen/Snakefile --configfile config/config.yaml satellite_screen --use-conda --retries 3
+snakemake -s satellite_screen/Snakefile --configfile config/config.yaml --use-conda --retries 3 satellite_screen
 ```
 
 **Why a separate Snakefile.** `results/repeatmasker_custom_lib.fasta` sits
@@ -699,7 +699,7 @@ supplemental manifest (same `manifest.tsv` schema) and point
 ```
 snakemake -s satellite_screen/Snakefile --configfile config/config.yaml \
   --config satellite_screen_manifest=config/supplemental_manifest.tsv \
-  satellite_screen --use-conda --retries 3
+  --use-conda --retries 3 satellite_screen
 ```
 (`satellite_screen_manifest` defaults to the main `manifest:` if not set —
 this only takes effect when you explicitly override it.) Reusing an
